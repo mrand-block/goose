@@ -13,3 +13,6 @@ pub use extensions::DEFAULT_DISPLAY_NAME;
 pub use extensions::DEFAULT_EXTENSION;
 pub use extensions::DEFAULT_EXTENSION_DESCRIPTION;
 pub use extensions::DEFAULT_EXTENSION_TIMEOUT;
+
+// Re-export security config
+pub use crate::security::config::SecurityConfig;

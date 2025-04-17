@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
 
-use crate::config::{Config, ExtensionConfigManager, PermissionManager};
+use crate::config::{Config, ExtensionConfigManager, PermissionManager, SecurityConfig};
 use crate::message::Message;
 use crate::permission::permission_judge::check_tool_permissions;
 use crate::permission::PermissionConfirmation;
@@ -60,10 +60,15 @@ impl Agent {
         // Create channels with buffer size 32 (adjust if needed)
         let (confirm_tx, confirm_rx) = mpsc::channel(32);
         let (tool_tx, tool_rx) = mpsc::channel(32);
+        
+        // Load security config from global config
+        let security_config = Config::global()
+            .get_param::<SecurityConfig>("security")
+            .unwrap_or_default();
 
         Self {
             provider,
-            extension_manager: Mutex::new(ExtensionManager::new()),
+            extension_manager: Mutex::new(ExtensionManager::new(Some(security_config))),
             frontend_tools: HashMap::new(),
             frontend_instructions: None,
             prompt_manager: PromptManager::new(),

@@ -5,6 +5,7 @@ use super::role::Role;
 use crate::resource::ResourceContents;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +199,23 @@ impl Content {
             Content::Text(text) => Content::text(text.text.clone()),
             Content::Image(image) => Content::image(image.data.clone(), image.mime_type.clone()),
             Content::Resource(resource) => Content::resource(resource.resource.clone()),
+        }
+    }
+}
+
+impl fmt::Display for Content {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Content::Text(text) => write!(f, "{}", text.text),
+            Content::Image(image) => write!(f, "[Image: {}]", image.mime_type),
+            Content::Resource(resource) => match &resource.resource {
+                ResourceContents::TextResourceContents { uri, text, .. } => {
+                    write!(f, "Resource {}: {}", uri, text)
+                }
+                ResourceContents::BlobResourceContents { uri, .. } => {
+                    write!(f, "Binary Resource {}", uri)
+                }
+            },
         }
     }
 }

@@ -10,11 +10,13 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task;
-use tracing::debug;
+use tracing::info;
 
 use super::extension::{ExtensionConfig, ExtensionError, ExtensionInfo, ExtensionResult, ToolInfo};
 use crate::config::ExtensionConfigManager;
 use crate::prompt_template;
+use crate::security::SecurityManager;
+use crate::security::config::SecurityConfig;
 use mcp_client::client::{ClientCapabilities, ClientInfo, McpClient, McpClientTrait};
 use mcp_client::transport::{SseTransport, StdioTransport, Transport};
 use mcp_core::{prompt::Prompt, Content, Tool, ToolCall, ToolError, ToolResult};
@@ -32,6 +34,7 @@ pub struct ExtensionManager {
     clients: HashMap<String, McpClientBox>,
     instructions: HashMap<String, String>,
     resource_capable_extensions: HashSet<String>,
+    security_manager: SecurityManager,
 }
 
 /// A flattened representation of a resource used by the agent to prepare inference
@@ -91,17 +94,18 @@ pub fn get_parameter_names(tool: &Tool) -> Vec<String> {
 
 impl Default for ExtensionManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl ExtensionManager {
     /// Create a new ExtensionManager instance
-    pub fn new() -> Self {
+    pub fn new(security_config: Option<SecurityConfig>) -> Self {
         Self {
             clients: HashMap::new(),
             instructions: HashMap::new(),
             resource_capable_extensions: HashSet::new(),
+            security_manager: SecurityManager::new(security_config.unwrap_or_default()),
         }
     }
 
@@ -431,6 +435,30 @@ impl ExtensionManager {
                 result.push(Content::text(content_str));
             }
         }
+        
+        // Scan the resource content for security threats
+        if let Ok(Some(scan_result)) = self.security_manager.scan_content(&result).await {
+            // Get safe content based on security policy
+            let safe_content = self.security_manager.get_safe_content(&result, &scan_result);
+            
+            // If content was modified, log it
+            if safe_content != result {
+                tracing::info!(
+                    uri = uri,
+                    extension = extension_name,
+                    "Resource content was modified by security scanner: {}",
+                    scan_result.explanation
+                );
+            }
+            
+            return Ok(safe_content);
+        } else {
+            tracing::info!(
+                uri = uri,
+                extension = extension_name,
+                "Security scanning skipped or failed for resource content"
+            );
+        }
 
         Ok(result)
     }
@@ -535,12 +563,46 @@ impl ExtensionManager {
             .await
             .map(|result| result.content)
             .map_err(|e| ToolError::ExecutionError(e.to_string()));
-
-        debug!(
+            
+        info!(
             "input" = serde_json::to_string(&tool_call).unwrap(),
             "output" = serde_json::to_string(&result).unwrap(),
         );
-
+        
+        // If result is an error, just return it
+        if result.is_err() {
+            return result;
+        }
+        
+        let content = result.as_ref().unwrap();
+        
+        // Scan the tool result for security threats
+        if let Ok(Some(scan_result)) = self.security_manager.scan_tool_result(
+            &tool_call.name, 
+            &tool_call.arguments, 
+            content
+        ).await {
+            // Get safe content based on security policy
+            let safe_content = self.security_manager.get_safe_content(content, &scan_result);
+            
+            // If content was modified, log it
+            if safe_content != *content {
+                tracing::info!(
+                    tool = tool_call.name,
+                    "Tool result was modified by security scanner: {}",
+                    scan_result.explanation
+                );
+            }
+            
+            return Ok(safe_content);
+        } else {
+            tracing::info!(
+                tool = tool_call.name,
+                "Security scanning skipped or failed for tool result"
+            );
+        }
+        
+        // Return original result if scanning is disabled or failed
         result
     }
 
