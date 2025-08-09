@@ -57,6 +57,7 @@ use super::platform_tools;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::agents::subagent_task_config::TaskConfig;
 use crate::conversation::message::{Message, ToolRequest};
+use crate::security::SecurityManager;
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 
@@ -97,6 +98,7 @@ pub struct Agent {
     pub(super) tool_route_manager: ToolRouteManager,
     pub(super) scheduler_service: Mutex<Option<Arc<dyn SchedulerTrait>>>,
     pub(super) retry_manager: RetryManager,
+    pub(super) security_manager: SecurityManager,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +175,7 @@ impl Agent {
             tool_route_manager: ToolRouteManager::new(),
             scheduler_service: Mutex::new(None),
             retry_manager,
+            security_manager: SecurityManager::new(),
         }
     }
 
@@ -1010,6 +1013,31 @@ impl Agent {
                                             &mut permission_manager,
                                             self.provider().await?,
                                         ).await;
+
+                                    // Scan tools for prompt injection
+                                    let security_results = self.security_manager
+                                        .filter_evil_tool_calls(messages.messages(), &permission_check_result)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!("Security scanning failed: {}", e);
+                                            vec![]
+                                        });
+
+                                    // Handle security results - for now just log them
+                                    for security_result in &security_results {
+                                        if security_result.is_malicious {
+                                            tracing::warn!(
+                                                confidence = security_result.confidence,
+                                                explanation = %security_result.explanation,
+                                                "Security threat detected in tool call"
+                                            );
+
+                                            if security_result.should_ask_user {
+                                                // TODO: Implement user confirmation using existing tool approval system
+                                                tracing::info!("Security threat requires user confirmation");
+                                            }
+                                        }
+                                    }
 
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
                                         &permission_check_result,
