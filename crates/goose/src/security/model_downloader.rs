@@ -1,4 +1,5 @@
-use anyhow::{anyhow};
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::fs;
@@ -6,6 +7,30 @@ use tokio::sync::OnceCell;
 
 pub struct ModelDownloader {
     cache_dir: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum ModelFormat {
+    OnnxDirect {
+        model_path: String,      // e.g., "onnx/model.onnx"
+        tokenizer_path: String,  // e.g., "onnx/tokenizer.json"
+    },
+    OnnxCustomPaths {
+        model_path: String,      // e.g., "model.onnx" (root level)
+        tokenizer_path: String,  // e.g., "tokenizer.json"
+    },
+    ConvertToOnnx,              // Fallback: convert PyTorch
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+struct RepoInfo {
+    siblings: Vec<FileInfo>,
+}
+
+#[derive(Deserialize)]
+struct FileInfo {
+    rfilename: String,
 }
 
 impl ModelDownloader {
@@ -47,13 +72,13 @@ impl ModelDownloader {
         // Create cache directory if it doesn't exist
         fs::create_dir_all(&self.cache_dir).await?;
 
-        // Download and convert the model - this blocks until complete
-        self.download_and_convert_model(model_info).await?;
+        // Use smart model loading - try ONNX direct first, fallback to conversion
+        self.load_model_smart(model_info).await?;
 
         // Verify the files were created
         if !model_path.exists() || !tokenizer_path.exists() {
             return Err(anyhow!(
-                "Model conversion completed but files not found at expected paths. Model: {:?}, Tokenizer: {:?}",
+                "Model download completed but files not found at expected paths. Model: {:?}, Tokenizer: {:?}",
                 model_path, tokenizer_path
             ));
         }
@@ -62,10 +87,161 @@ impl ModelDownloader {
             model = %model_info.hf_model_name,
             model_path = ?model_path,
             tokenizer_path = ?tokenizer_path,
-            "✅ Successfully downloaded and converted model"
+            "✅ Successfully downloaded model"
         );
 
         Ok((model_path, tokenizer_path))
+    }
+
+    /// Smart model loading - tries ONNX direct download first, falls back to conversion
+    async fn load_model_smart(&self, model_info: &ModelInfo) -> anyhow::Result<()> {
+        let format = self.discover_model_format(&model_info.hf_model_name).await?;
+        
+        match format {
+            ModelFormat::OnnxDirect { model_path, tokenizer_path } => {
+                tracing::info!("🔍 Found ONNX files in standard location for {}", model_info.hf_model_name);
+                self.download_onnx_files(&model_info.hf_model_name, &model_path, &tokenizer_path, model_info).await
+            }
+            
+            ModelFormat::OnnxCustomPaths { model_path, tokenizer_path } => {
+                tracing::info!("🔍 Found ONNX files in custom location for {}", model_info.hf_model_name);
+                self.download_onnx_files(&model_info.hf_model_name, &model_path, &tokenizer_path, model_info).await
+            }
+            
+            ModelFormat::ConvertToOnnx => {
+                tracing::info!("🔄 No ONNX files found, will convert PyTorch model for {}", model_info.hf_model_name);
+                self.download_and_convert_model(model_info).await  // Existing approach
+            }
+            
+            ModelFormat::Unsupported => {
+                Err(anyhow!("Model {} has no supported format (no ONNX or PyTorch files)", model_info.hf_model_name))
+            }
+        }
+    }
+
+    /// Discover what format a model is available in
+    async fn discover_model_format(&self, repo: &str) -> anyhow::Result<ModelFormat> {
+        let files = self.get_repo_files(repo).await?;
+        
+        // Strategy 1: Look for standard onnx/ folder (like protectai model)
+        if files.iter().any(|f| f.starts_with("onnx/")) {
+            return Ok(ModelFormat::OnnxDirect {
+                model_path: "onnx/model.onnx".to_string(),
+                tokenizer_path: "onnx/tokenizer.json".to_string(),
+            });
+        }
+        
+        // Strategy 2: Look for ONNX files in root or custom locations
+        let onnx_files: Vec<_> = files.iter()
+            .filter(|f| f.ends_with(".onnx"))
+            .collect();
+        
+        let tokenizer_files: Vec<_> = files.iter()
+            .filter(|f| f.contains("tokenizer") && f.ends_with(".json"))
+            .collect();
+        
+        if !onnx_files.is_empty() && !tokenizer_files.is_empty() {
+            return Ok(ModelFormat::OnnxCustomPaths {
+                model_path: onnx_files[0].clone(),
+                tokenizer_path: tokenizer_files[0].clone(),
+            });
+        }
+        
+        // Strategy 3: Check if we can convert PyTorch model
+        if files.iter().any(|f| f == "pytorch_model.bin" || f == "model.safetensors") {
+            return Ok(ModelFormat::ConvertToOnnx);
+        }
+        
+        Ok(ModelFormat::Unsupported)
+    }
+
+    /// Get list of files in a HuggingFace repository
+    async fn get_repo_files(&self, repo: &str) -> anyhow::Result<Vec<String>> {
+        let api_url = format!("https://huggingface.co/api/models/{}", repo);
+        let client = reqwest::Client::new();
+        
+        let mut request = client.get(&api_url);
+        
+        // Optional authentication
+        if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        
+        let response = request.send().await?;
+        
+        if response.status() == 404 {
+            return Err(anyhow!("Model repository '{}' not found", repo));
+        }
+        
+        if response.status() == 401 {
+            return Err(anyhow!(
+                "Model '{}' requires authentication. Set HUGGINGFACE_TOKEN environment variable.\n\
+                 Get a token from: https://huggingface.co/settings/tokens", 
+                repo
+            ));
+        }
+        
+        let repo_info: RepoInfo = response.json().await?;
+        Ok(repo_info.siblings.into_iter().map(|f| f.rfilename).collect())
+    }
+
+    /// Download ONNX files directly from HuggingFace
+    async fn download_onnx_files(
+        &self,
+        model_name: &str, 
+        model_path: &str, 
+        tokenizer_path: &str,
+        model_info: &ModelInfo,
+    ) -> anyhow::Result<()> {
+        let base_url = format!("https://huggingface.co/{}/resolve/main/", model_name);
+        
+        // Download model file
+        let model_url = format!("{}{}", base_url, model_path);
+        let local_model_path = self.cache_dir.join(&model_info.onnx_filename);
+        tracing::info!("📥 Downloading ONNX model from: {}", model_url);
+        self.download_file_with_auth(&model_url, &local_model_path).await?;
+        
+        // Download tokenizer file
+        let tokenizer_url = format!("{}{}", base_url, tokenizer_path);
+        let local_tokenizer_path = self.cache_dir.join(&model_info.tokenizer_filename);
+        tracing::info!("📥 Downloading tokenizer from: {}", tokenizer_url);
+        self.download_file_with_auth(&tokenizer_url, &local_tokenizer_path).await?;
+        
+        Ok(())
+    }
+
+    /// Download a file with optional authentication
+    async fn download_file_with_auth(&self, url: &str, local_path: &PathBuf) -> anyhow::Result<()> {
+        let client = reqwest::Client::new();
+        let mut request = client.get(url);
+        
+        // Use HF token if available
+        if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        
+        let response = request.send().await?;
+        
+        if response.status() == 401 {
+            return Err(anyhow!(
+                "File requires authentication. Set HUGGINGFACE_TOKEN environment variable."
+            ));
+        }
+        
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Failed to download file from {}: HTTP {}",
+                url,
+                response.status()
+            ));
+        }
+        
+        let bytes = response.bytes().await?;
+        fs::write(local_path, bytes).await?;
+        
+        tracing::info!("✅ Downloaded: {} ({} bytes)", local_path.display(), fs::metadata(local_path).await?.len());
+        
+        Ok(())
     }
 
     async fn download_and_convert_model(&self, model_info: &ModelInfo) -> anyhow::Result<()> {
