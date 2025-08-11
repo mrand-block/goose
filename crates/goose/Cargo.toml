@@ -100,6 +100,10 @@ tokio-util = "0.7.15"
 lancedb = "0.13"
 arrow = "52.2"
 
+# ML inference backends for security scanning
+ort = "2.0.0-rc.6"  # ONNX Runtime
+tokenizers = "0.20.3"  # HuggingFace tokenizers
+
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["wincred"] }
 

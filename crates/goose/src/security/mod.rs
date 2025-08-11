@@ -64,7 +64,9 @@ impl SecurityManager {
     }
 
     /// Main security check function - called from reply_internal
-    pub async fn filter_evil_tool_calls(
+    /// Uses the proper two-step security analysis process
+    /// Scans ALL tools (approved + needs_approval) for security threats
+    pub async fn filter_malicious_tool_calls(
         &self,
         messages: &[Message],
         permission_check_result: &PermissionCheckResult,
@@ -76,45 +78,45 @@ impl SecurityManager {
 
         let mut results = Vec::new();
 
-        // Check tools that need approval for potential security issues
-        for tool_request in &permission_check_result.needs_approval {
+        // Collect ALL tool requests (approved + needs_approval) for security scanning
+        let mut all_tool_requests = Vec::new();
+        all_tool_requests.extend(&permission_check_result.approved);
+        all_tool_requests.extend(&permission_check_result.needs_approval);
+
+        // Check ALL tools for potential security issues
+        for tool_request in &all_tool_requests {
             if let Ok(tool_call) = &tool_request.tool_call {
                 tracing::info!(
                     tool_name = %tool_call.name,
-                    "🔍 Analyzing tool call for security threats"
+                    "🔍 Starting two-step security analysis for tool call"
                 );
 
-                // First, check if the tool call itself looks suspicious
-                let tool_suspicious = scanner.scan_tool_call(tool_call).await?;
-                
-                if tool_suspicious.is_malicious {
-                    // Tool call looks suspicious, analyze conversation context
+                // Use the new two-step analysis method
+                let analysis_result = scanner.analyze_tool_call_with_context(
+                    tool_call,
+                    messages,
+                ).await?;
+
+                if analysis_result.is_malicious {
                     tracing::warn!(
                         tool_name = %tool_call.name,
-                        confidence = tool_suspicious.confidence,
-                        "🚨 Suspicious tool call detected, analyzing conversation context"
+                        confidence = analysis_result.confidence,
+                        explanation = %analysis_result.explanation,
+                        "🚨 Tool call flagged as malicious after two-step analysis"
                     );
 
-                    let context_result = scanner.analyze_conversation_context(
-                        messages,
-                        tool_call,
-                    ).await?;
-
                     results.push(SecurityResult {
-                        is_malicious: context_result.is_malicious,
-                        confidence: context_result.confidence,
-                        explanation: format!(
-                            "Tool '{}' flagged as suspicious (confidence: {:.2}). Context analysis: {}",
-                            tool_call.name,
-                            tool_suspicious.confidence,
-                            context_result.explanation
-                        ),
-                        should_ask_user: context_result.is_malicious && context_result.confidence > 0.7,
+                        is_malicious: analysis_result.is_malicious,
+                        confidence: analysis_result.confidence,
+                        explanation: analysis_result.explanation,
+                        should_ask_user: analysis_result.confidence > 0.7,
                     });
                 } else {
                     tracing::debug!(
                         tool_name = %tool_call.name,
-                        "✅ Tool call passed security check"
+                        confidence = analysis_result.confidence,
+                        explanation = %analysis_result.explanation,
+                        "✅ Tool call passed two-step security analysis"
                     );
                 }
             }

@@ -371,19 +371,13 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
-    pub fn deepset_deberta() -> Self {
+    pub fn from_config_model(model_name: &str) -> Self {
+        // Keep the original model name format for filenames to match what model_downloader creates
+        let safe_filename = model_name.replace("/", "_");
         Self {
-            hf_model_name: "deepset/deberta-v3-base-injection".to_string(),
-            onnx_filename: "deepset_deberta-v3-base-injection.onnx".to_string(),
-            tokenizer_filename: "deepset_deberta-v3-base-injection_tokenizer.json".to_string(),
-        }
-    }
-
-    pub fn protectai_deberta() -> Self {
-        Self {
-            hf_model_name: "protectai/deberta-v3-base-prompt-injection-v2".to_string(),
-            onnx_filename: "protectai_deberta-v3-base-prompt-injection-v2.onnx".to_string(),
-            tokenizer_filename: "protectai_deberta-v3-base-prompt-injection-v2_tokenizer.json".to_string(),
+            hf_model_name: model_name.to_string(),
+            onnx_filename: format!("{}.onnx", safe_filename),
+            tokenizer_filename: format!("{}_tokenizer.json", safe_filename),
         }
     }
 }

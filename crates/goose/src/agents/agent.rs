@@ -1014,9 +1014,31 @@ impl Agent {
                                             self.provider().await?,
                                         ).await;
 
+                                    // DEBUG: Log tool categorization
+                                    println!("🔍 DEBUG: Tool categorization results:");
+                                    println!("  - {} tools approved (pre-approved)", permission_check_result.approved.len());
+                                    println!("  - {} tools need approval", permission_check_result.needs_approval.len());
+                                    println!("  - {} tools denied", permission_check_result.denied.len());
+                                    println!("  - {} readonly tools", readonly_tools.len());
+                                    println!("  - {} regular tools", regular_tools.len());
+                                    
+                                    for (i, tool_req) in remaining_requests.iter().enumerate() {
+                                        if let Ok(tool_call) = &tool_req.tool_call {
+                                            println!("  - Tool {}: '{}' -> {}", i, tool_call.name, 
+                                                if permission_check_result.approved.iter().any(|r| r.id == tool_req.id) { "APPROVED" }
+                                                else if permission_check_result.needs_approval.iter().any(|r| r.id == tool_req.id) { "NEEDS_APPROVAL" }
+                                                else if permission_check_result.denied.iter().any(|r| r.id == tool_req.id) { "DENIED" }
+                                                else { "UNKNOWN" }
+                                            );
+                                        }
+                                    }
+
                                     // Scan tools for prompt injection
+                                    let total_tools = permission_check_result.approved.len() + permission_check_result.needs_approval.len();
+                                    println!("🔍 DEBUG: About to call security manager with {} total tools ({} approved + {} need approval)", 
+                                        total_tools, permission_check_result.approved.len(), permission_check_result.needs_approval.len());
                                     let security_results = self.security_manager
-                                        .filter_evil_tool_calls(messages.messages(), &permission_check_result)
+                                        .filter_malicious_tool_calls(messages.messages(), &permission_check_result)
                                         .await
                                         .unwrap_or_else(|e| {
                                             tracing::warn!("Security scanning failed: {}", e);
@@ -1024,7 +1046,10 @@ impl Agent {
                                         });
 
                                     // Handle security results - for now just log them
+                                    println!("🔍 DEBUG: Security scan returned {} results", security_results.len());
                                     for security_result in &security_results {
+                                        println!("🔍 DEBUG: Security result - malicious: {}, confidence: {:.2}, explanation: {}", 
+                                            security_result.is_malicious, security_result.confidence, security_result.explanation);
                                         if security_result.is_malicious {
                                             tracing::warn!(
                                                 confidence = security_result.confidence,
