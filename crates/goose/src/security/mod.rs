@@ -124,6 +124,43 @@ impl SecurityManager {
 
         Ok(results)
     }
+
+    /// Check if models need to be downloaded and return appropriate user message
+    pub async fn check_model_download_status(&self) -> Option<String> {
+        let Some(_scanner) = &self.scanner else {
+            return None;
+        };
+
+        // Check if models are already available in memory
+        if let Some(_model) = scanner::get_model_if_available().await {
+            return None; // Models ready, no message needed
+        }
+
+        // Check if models exist on disk but aren't loaded
+        if Self::models_exist_on_disk() {
+            return Some("🔒 Loading security models...".to_string());
+        }
+
+        // Models need to be downloaded
+        Some("🔒 Setting up security scanning for first time use - this could take a minute...".to_string())
+    }
+
+    /// Check if model files exist on disk
+    fn models_exist_on_disk() -> bool {
+        use crate::security::scanner::PromptInjectionScanner;
+        
+        let model_info = PromptInjectionScanner::get_model_info_from_config();
+        
+        if let Some(cache_dir) = dirs::cache_dir() {
+            let security_models_dir = cache_dir.join("goose").join("security_models");
+            let model_path = security_models_dir.join(&model_info.onnx_filename);
+            let tokenizer_path = security_models_dir.join(&model_info.tokenizer_filename);
+            
+            return model_path.exists() && tokenizer_path.exists();
+        }
+        
+        false
+    }
 }
 
 impl Default for SecurityManager {

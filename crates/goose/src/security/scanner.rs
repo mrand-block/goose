@@ -228,6 +228,19 @@ async fn get_model() -> Option<Arc<dyn PromptInjectionModel>> {
     }
 }
 
+/// Check if model is available without triggering download/initialization
+pub async fn get_model_if_available() -> Option<Arc<dyn PromptInjectionModel>> {
+    let cache = MODEL_CACHE
+        .get_or_init(|| async { 
+            Arc::new(tokio::sync::RwLock::new(None))
+        })
+        .await;
+    
+    // Only check if model is already loaded in memory - don't trigger loading
+    let read_guard = cache.read().await;
+    read_guard.as_ref().cloned()
+}
+
 /// Simple prompt injection scanner
 /// Uses the existing model_downloader infrastructure
 pub struct PromptInjectionScanner {
@@ -313,7 +326,7 @@ impl PromptInjectionScanner {
     }
 
     /// Get model information from config file
-    fn get_model_info_from_config() -> ModelInfo {
+    pub fn get_model_info_from_config() -> ModelInfo {
         use crate::config::Config;
         let config = Config::global();
         

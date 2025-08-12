@@ -1014,23 +1014,9 @@ impl Agent {
                                             self.provider().await?,
                                         ).await;
 
-                                    // DEBUG: Log tool categorization
-                                    println!("🔍 DEBUG: Tool categorization results:");
-                                    println!("  - {} tools approved (pre-approved)", permission_check_result.approved.len());
-                                    println!("  - {} tools need approval", permission_check_result.needs_approval.len());
-                                    println!("  - {} tools denied", permission_check_result.denied.len());
-                                    println!("  - {} readonly tools", readonly_tools.len());
-                                    println!("  - {} regular tools", regular_tools.len());
-                                    
-                                    for (i, tool_req) in remaining_requests.iter().enumerate() {
-                                        if let Ok(tool_call) = &tool_req.tool_call {
-                                            println!("  - Tool {}: '{}' -> {}", i, tool_call.name, 
-                                                if permission_check_result.approved.iter().any(|r| r.id == tool_req.id) { "APPROVED" }
-                                                else if permission_check_result.needs_approval.iter().any(|r| r.id == tool_req.id) { "NEEDS_APPROVAL" }
-                                                else if permission_check_result.denied.iter().any(|r| r.id == tool_req.id) { "DENIED" }
-                                                else { "UNKNOWN" }
-                                            );
-                                        }
+                                    // Check if we need to show model download status before security scanning
+                                    if let Some(download_message) = self.security_manager.check_model_download_status().await {
+                                        yield AgentEvent::Message(Message::assistant().with_text(download_message));
                                     }
 
                                     // Scan tools for prompt injection
