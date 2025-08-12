@@ -457,12 +457,7 @@ impl PromptInjectionScanner {
             // User messages contain prompt injection - tool call is likely malicious
             let combined_confidence = (tool_call_result.confidence + user_messages_result.confidence) / 2.0;
             let explanation = format!(
-                "MALICIOUS: Tool '{}' appears to be result of prompt injection. Tool scan: {:.2} confidence ({}). User messages scan: {:.2} confidence ({})",
-                tool_call.name,
-                tool_call_result.confidence,
-                if tool_call_result.is_malicious { "suspicious" } else { "clean" },
-                user_messages_result.confidence,
-                user_messages_result.explanation
+                "Tool appears to be the result of a prompt injection attack."
             );
             (true, combined_confidence.max(0.8), explanation)
         } else {
@@ -470,11 +465,7 @@ impl PromptInjectionScanner {
             // Lower the confidence since user didn't inject malicious prompts
             let adjusted_confidence = tool_call_result.confidence * 0.6; // Reduce confidence
             let explanation = format!(
-                "LIKELY SAFE: Tool '{}' flagged as suspicious but user messages appear clean. Tool scan: {:.2} confidence. User messages: clean ({:.2} confidence). Adjusted confidence: {:.2}",
-                tool_call.name,
-                tool_call_result.confidence,
-                user_messages_result.confidence,
-                adjusted_confidence
+                "Tool flagged as suspicious but user messages appear clean."
             );
             
             // Only consider malicious if adjusted confidence is still high AND tool is high-risk
@@ -562,14 +553,16 @@ impl PromptInjectionScanner {
         // Mark as malicious if either method detects it
         let final_is_malicious = pattern_result.is_malicious || ml_is_malicious;
         
+        // Simplified explanation - just show what detected the threat
         let combined_explanation = if pattern_result.is_malicious && ml_is_malicious {
-            format!("BOTH LAYERS DETECTED THREAT - Pattern: {} | ML: {}", pattern_result.explanation, ml_explanation)
+            "Detected by both pattern analysis and ML model".to_string()
         } else if pattern_result.is_malicious {
-            format!("PATTERN DETECTION - {} | ML: {} (confidence: {:.3})", pattern_result.explanation, ml_explanation, ml_confidence)
+            format!("Detected by pattern analysis: {}", 
+                   pattern_result.explanation.replace("Pattern-based detection: ", ""))
         } else if ml_is_malicious {
-            format!("ML DETECTION - {} | Pattern: {}", ml_explanation, pattern_result.explanation)
+            "Detected by machine learning model".to_string()
         } else {
-            format!("CLEAN - Pattern: {} | ML: {}", pattern_result.explanation, ml_explanation)
+            "No threats detected".to_string()
         };
         
         ScanResult {

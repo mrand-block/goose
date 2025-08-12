@@ -55,14 +55,54 @@ impl Agent {
         message_tool_response: Arc<Mutex<Message>>,
         cancellation_token: Option<CancellationToken>,
     ) -> BoxStream<'a, anyhow::Result<Message>> {
+        self.handle_approval_tool_requests_with_security(
+            tool_requests,
+            tool_futures,
+            permission_manager,
+            message_tool_response,
+            cancellation_token,
+            None, // No security context by default
+        )
+    }
+
+    pub(crate) fn handle_approval_tool_requests_with_security<'a>(
+        &'a self,
+        tool_requests: &'a [ToolRequest],
+        tool_futures: Arc<Mutex<Vec<(String, ToolStream)>>>,
+        permission_manager: &'a mut PermissionManager,
+        message_tool_response: Arc<Mutex<Message>>,
+        cancellation_token: Option<CancellationToken>,
+        security_results: Option<&'a [Option<&'a crate::security::SecurityResult>]>,
+    ) -> BoxStream<'a, anyhow::Result<Message>> {
         try_stream! {
-            for request in tool_requests {
+            for (i, request) in tool_requests.iter().enumerate() {
                 if let Ok(tool_call) = request.tool_call.clone() {
+                    // Check if this tool has security concerns
+                    // Match by index since security results are provided in the same order as tool requests
+                    let security_context = security_results
+                        .and_then(|results| results.get(i))
+                        .and_then(|result| *result)
+                        .filter(|result| result.is_malicious);
+
+                    let confirmation_prompt = if let Some(security_result) = security_context {
+                        format!(
+                            "🚨 SECURITY WARNING: This tool call has been flagged as potentially malicious.\n\
+                            Confidence: {:.1}%\n\
+                            Reason: {}\n\n\
+                            Goose would still like to call the above tool. \n\
+                            Please review carefully. Allow? (y/n):",
+                            security_result.confidence * 100.0,
+                            security_result.explanation
+                        )
+                    } else {
+                        "Goose would like to call the above tool. Allow? (y/n):".to_string()
+                    };
+
                     let confirmation = Message::user().with_tool_confirmation_request(
                         request.id.clone(),
                         tool_call.name.clone(),
                         tool_call.arguments.clone(),
-                        Some("Goose would like to call the above tool. Allow? (y/n):".to_string()),
+                        Some(confirmation_prompt),
                     );
                     yield confirmation;
 
