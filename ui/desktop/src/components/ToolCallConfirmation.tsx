@@ -190,9 +190,12 @@ export default function ToolConfirmation({
         </div>
       ) : (
         <div className="goose-message-tool bg-background-default border border-borderSubtle dark:border-gray-700 rounded-b-2xl px-4 pt-2 pb-2 flex gap-2 items-center">
-          <Button className="rounded-full" onClick={() => handleButtonClick(ALWAYS_ALLOW)}>
-            Always Allow
-          </Button>
+          {/* Hide "Always Allow" for security warnings to prevent bypassing future security checks */}
+          {!prompt?.includes('SECURITY WARNING') && (
+            <Button className="rounded-full" onClick={() => handleButtonClick(ALWAYS_ALLOW)}>
+              Always Allow
+            </Button>
+          )}
           <Button
             className="rounded-full"
             variant="secondary"
