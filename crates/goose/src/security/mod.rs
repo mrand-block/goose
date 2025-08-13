@@ -1,9 +1,9 @@
-pub mod scanner;
 pub mod model_downloader;
+pub mod scanner;
 
-use anyhow::Result;
 use crate::conversation::message::Message;
 use crate::permission::permission_judge::PermissionCheckResult;
+use anyhow::Result;
 use scanner::PromptInjectionScanner;
 
 /// Simple security manager for the POC
@@ -23,11 +23,11 @@ pub struct SecurityResult {
 impl SecurityManager {
     pub fn new() -> Self {
         println!("🔒 SecurityManager::new() called - checking if security should be enabled");
-        
+
         // Initialize scanner based on config
         let should_enable = Self::should_enable_security();
         println!("🔒 Security enabled check result: {}", should_enable);
-        
+
         let scanner = match should_enable {
             true => {
                 println!("🔒 Initializing security scanner");
@@ -49,17 +49,20 @@ impl SecurityManager {
         // Check config file for security settings
         use crate::config::Config;
         let config = Config::global();
-        
+
         // Try to get security.enabled from config
-        let result = config.get_param::<serde_json::Value>("security")
+        let result = config
+            .get_param::<serde_json::Value>("security")
             .ok()
             .and_then(|security_config| security_config.get("enabled")?.as_bool())
             .unwrap_or(false);
-        
-        println!("🔒 Config check - security config result: {:?}", 
-                 config.get_param::<serde_json::Value>("security"));
+
+        println!(
+            "🔒 Config check - security config result: {:?}",
+            config.get_param::<serde_json::Value>("security")
+        );
         println!("🔒 Final security enabled result: {}", result);
-        
+
         result
     }
 
@@ -92,10 +95,9 @@ impl SecurityManager {
                 );
 
                 // Use the new two-step analysis method
-                let analysis_result = scanner.analyze_tool_call_with_context(
-                    tool_call,
-                    messages,
-                ).await?;
+                let analysis_result = scanner
+                    .analyze_tool_call_with_context(tool_call, messages)
+                    .await?;
 
                 if analysis_result.is_malicious {
                     tracing::warn!(
@@ -142,23 +144,26 @@ impl SecurityManager {
         }
 
         // Models need to be downloaded
-        Some("🔒 Setting up security scanning for first time use - this could take a minute...".to_string())
+        Some(
+            "🔒 Setting up security scanning for first time use - this could take a minute..."
+                .to_string(),
+        )
     }
 
     /// Check if model files exist on disk
     fn models_exist_on_disk() -> bool {
         use crate::security::scanner::PromptInjectionScanner;
-        
+
         let model_info = PromptInjectionScanner::get_model_info_from_config();
-        
+
         if let Some(cache_dir) = dirs::cache_dir() {
             let security_models_dir = cache_dir.join("goose").join("security_models");
             let model_path = security_models_dir.join(&model_info.onnx_filename);
             let tokenizer_path = security_models_dir.join(&model_info.tokenizer_filename);
-            
+
             return model_path.exists() && tokenizer_path.exists();
         }
-        
+
         false
     }
 }

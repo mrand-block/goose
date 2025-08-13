@@ -1081,6 +1081,29 @@ impl Agent {
                                         );
                                     }
                                 } else {
+                                    // Check if we need to show model download status before security scanning
+                                    if let Some(download_message) = self.security_manager.check_model_download_status().await {
+                                        yield AgentEvent::Message(Message::assistant().with_text(download_message));
+                                    }
+
+                                    // SECURITY FIX: Scan tools for prompt injection BEFORE permission checking
+                                    // This ensures security results can override auto-mode approvals
+                                    let initial_permission_result = PermissionCheckResult {
+                                        approved: remaining_requests.clone(),
+                                        needs_approval: vec![],
+                                        denied: vec![],
+                                    };
+
+                                    println!("🔍 DEBUG: About to call security manager with {} total tools", remaining_requests.len());
+                                    let security_results = self.security_manager
+                                        .filter_malicious_tool_calls(messages.messages(), &initial_permission_result)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!("Security scanning failed: {}", e);
+                                            vec![]
+                                        });
+
+                                    // Now run permission checking with security context
                                     let mut permission_manager = PermissionManager::default();
                                     let (permission_check_result, enable_extension_request_ids) =
                                         check_tool_permissions(
@@ -1092,32 +1115,15 @@ impl Agent {
                                             self.provider().await?,
                                         ).await;
 
-                                    // Check if we need to show model download status before security scanning
-                                    if let Some(download_message) = self.security_manager.check_model_download_status().await {
-                                        yield AgentEvent::Message(Message::assistant().with_text(download_message));
-                                    }
-
-                                    // Scan tools for prompt injection
-                                    let total_tools = permission_check_result.approved.len() + permission_check_result.needs_approval.len();
-                                    println!("🔍 DEBUG: About to call security manager with {} total tools ({} approved + {} need approval)", 
-                                        total_tools, permission_check_result.approved.len(), permission_check_result.needs_approval.len());
-                                    let security_results = self.security_manager
-                                        .filter_malicious_tool_calls(messages.messages(), &permission_check_result)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!("Security scanning failed: {}", e);
-                                            vec![]
-                                        });
-
-                                    // Apply security results to permission check result
+                                    // Apply security results to override permission decisions
                                     let final_permission_result = self.apply_security_results_to_permissions(
-                                        permission_check_result, 
+                                        permission_check_result,
                                         &security_results
                                     ).await;
 
-                                    println!("🔍 DEBUG: After security integration - {} approved, {} need approval, {} denied", 
-                                        final_permission_result.approved.len(), 
-                                        final_permission_result.needs_approval.len(), 
+                                    println!("🔍 DEBUG: After security integration - {} approved, {} need approval, {} denied",
+                                        final_permission_result.approved.len(),
+                                        final_permission_result.needs_approval.len(),
                                         final_permission_result.denied.len());
 
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
@@ -1131,7 +1137,7 @@ impl Agent {
                                     // Process tools requiring approval (including security-flagged tools)
                                     // Create a mapping of security results for tools that need approval
                                     let mut security_results_for_approval: Vec<Option<&crate::security::SecurityResult>> = Vec::new();
-                                    for approval_request in &final_permission_result.needs_approval {
+                                    for _approval_request in &final_permission_result.needs_approval {
                                         // Find the corresponding security result for this tool request
                                         let security_result = security_results.iter().find(|result| {
                                             // Match by checking if this tool was flagged as malicious
@@ -1286,8 +1292,9 @@ impl Agent {
         }
 
         // Create a map of tool requests by ID for easy lookup
-        let mut all_requests: std::collections::HashMap<String, ToolRequest> = std::collections::HashMap::new();
-        
+        let mut all_requests: std::collections::HashMap<String, ToolRequest> =
+            std::collections::HashMap::new();
+
         // Collect all tool requests
         for req in &permission_result.approved {
             all_requests.insert(req.id.clone(), req.clone());
@@ -1300,7 +1307,9 @@ impl Agent {
         }
 
         // Collect the combined requests first to avoid borrowing issues
-        let combined_requests: Vec<ToolRequest> = permission_result.approved.iter()
+        let combined_requests: Vec<ToolRequest> = permission_result
+            .approved
+            .iter()
             .chain(permission_result.needs_approval.iter())
             .cloned()
             .collect();
@@ -1314,7 +1323,7 @@ impl Agent {
             // Find the corresponding tool request by index
             if let Some(tool_request) = combined_requests.get(i) {
                 let request_id = &tool_request.id;
-                
+
                 tracing::warn!(
                     tool_request_id = %request_id,
                     confidence = security_result.confidence,
@@ -1323,23 +1332,35 @@ impl Agent {
                 );
 
                 // Remove from approved if present
-                permission_result.approved.retain(|req| req.id != *request_id);
-                
+                permission_result
+                    .approved
+                    .retain(|req| req.id != *request_id);
+
                 if security_result.should_ask_user {
                     // Move to needs_approval with security context
                     if let Some(request) = all_requests.get(request_id) {
                         // Only add if not already in needs_approval
-                        if !permission_result.needs_approval.iter().any(|req| req.id == *request_id) {
+                        if !permission_result
+                            .needs_approval
+                            .iter()
+                            .any(|req| req.id == *request_id)
+                        {
                             permission_result.needs_approval.push(request.clone());
                         }
                     }
                 } else {
                     // High confidence threat - move to denied
-                    permission_result.needs_approval.retain(|req| req.id != *request_id);
-                    
+                    permission_result
+                        .needs_approval
+                        .retain(|req| req.id != *request_id);
+
                     if let Some(request) = all_requests.get(request_id) {
                         // Only add if not already in denied
-                        if !permission_result.denied.iter().any(|req| req.id == *request_id) {
+                        if !permission_result
+                            .denied
+                            .iter()
+                            .any(|req| req.id == *request_id)
+                        {
                             permission_result.denied.push(request.clone());
                         }
                     }

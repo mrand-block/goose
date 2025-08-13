@@ -12,14 +12,14 @@ pub struct ModelDownloader {
 #[derive(Debug)]
 pub enum ModelFormat {
     OnnxDirect {
-        model_path: String,      // e.g., "onnx/model.onnx"
-        tokenizer_path: String,  // e.g., "onnx/tokenizer.json"
+        model_path: String,     // e.g., "onnx/model.onnx"
+        tokenizer_path: String, // e.g., "onnx/tokenizer.json"
     },
     OnnxCustomPaths {
-        model_path: String,      // e.g., "model.onnx" (root level)
-        tokenizer_path: String,  // e.g., "tokenizer.json"
+        model_path: String,     // e.g., "model.onnx" (root level)
+        tokenizer_path: String, // e.g., "tokenizer.json"
     },
-    ConvertToOnnx,              // Fallback: convert PyTorch
+    ConvertToOnnx, // Fallback: convert PyTorch
     Unsupported,
 }
 
@@ -50,7 +50,10 @@ impl ModelDownloader {
         Ok(Self { cache_dir })
     }
 
-    pub async fn ensure_model_available(&self, model_info: &ModelInfo) -> anyhow::Result<(PathBuf, PathBuf)> {
+    pub async fn ensure_model_available(
+        &self,
+        model_info: &ModelInfo,
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
         let model_path = self.cache_dir.join(&model_info.onnx_filename);
         let tokenizer_path = self.cache_dir.join(&model_info.tokenizer_filename);
 
@@ -95,34 +98,64 @@ impl ModelDownloader {
 
     /// Smart model loading - tries ONNX direct download first, falls back to conversion
     async fn load_model_smart(&self, model_info: &ModelInfo) -> anyhow::Result<()> {
-        let format = self.discover_model_format(&model_info.hf_model_name).await?;
-        
+        let format = self
+            .discover_model_format(&model_info.hf_model_name)
+            .await?;
+
         match format {
-            ModelFormat::OnnxDirect { model_path, tokenizer_path } => {
-                tracing::info!("🔍 Found ONNX files in standard location for {}", model_info.hf_model_name);
-                self.download_onnx_files(&model_info.hf_model_name, &model_path, &tokenizer_path, model_info).await
+            ModelFormat::OnnxDirect {
+                model_path,
+                tokenizer_path,
+            } => {
+                tracing::info!(
+                    "🔍 Found ONNX files in standard location for {}",
+                    model_info.hf_model_name
+                );
+                self.download_onnx_files(
+                    &model_info.hf_model_name,
+                    &model_path,
+                    &tokenizer_path,
+                    model_info,
+                )
+                .await
             }
-            
-            ModelFormat::OnnxCustomPaths { model_path, tokenizer_path } => {
-                tracing::info!("🔍 Found ONNX files in custom location for {}", model_info.hf_model_name);
-                self.download_onnx_files(&model_info.hf_model_name, &model_path, &tokenizer_path, model_info).await
+
+            ModelFormat::OnnxCustomPaths {
+                model_path,
+                tokenizer_path,
+            } => {
+                tracing::info!(
+                    "🔍 Found ONNX files in custom location for {}",
+                    model_info.hf_model_name
+                );
+                self.download_onnx_files(
+                    &model_info.hf_model_name,
+                    &model_path,
+                    &tokenizer_path,
+                    model_info,
+                )
+                .await
             }
-            
+
             ModelFormat::ConvertToOnnx => {
-                tracing::info!("🔄 No ONNX files found, will convert PyTorch model for {}", model_info.hf_model_name);
-                self.download_and_convert_model(model_info).await  // Existing approach
+                tracing::info!(
+                    "🔄 No ONNX files found, will convert PyTorch model for {}",
+                    model_info.hf_model_name
+                );
+                self.download_and_convert_model(model_info).await // Existing approach
             }
-            
-            ModelFormat::Unsupported => {
-                Err(anyhow!("Model {} has no supported format (no ONNX or PyTorch files)", model_info.hf_model_name))
-            }
+
+            ModelFormat::Unsupported => Err(anyhow!(
+                "Model {} has no supported format (no ONNX or PyTorch files)",
+                model_info.hf_model_name
+            )),
         }
     }
 
     /// Discover what format a model is available in
     async fn discover_model_format(&self, repo: &str) -> anyhow::Result<ModelFormat> {
         let files = self.get_repo_files(repo).await?;
-        
+
         // Strategy 1: Look for standard onnx/ folder (like protectai model)
         if files.iter().any(|f| f.starts_with("onnx/")) {
             return Ok(ModelFormat::OnnxDirect {
@@ -130,28 +163,30 @@ impl ModelDownloader {
                 tokenizer_path: "onnx/tokenizer.json".to_string(),
             });
         }
-        
+
         // Strategy 2: Look for ONNX files in root or custom locations
-        let onnx_files: Vec<_> = files.iter()
-            .filter(|f| f.ends_with(".onnx"))
-            .collect();
-        
-        let tokenizer_files: Vec<_> = files.iter()
+        let onnx_files: Vec<_> = files.iter().filter(|f| f.ends_with(".onnx")).collect();
+
+        let tokenizer_files: Vec<_> = files
+            .iter()
             .filter(|f| f.contains("tokenizer") && f.ends_with(".json"))
             .collect();
-        
+
         if !onnx_files.is_empty() && !tokenizer_files.is_empty() {
             return Ok(ModelFormat::OnnxCustomPaths {
                 model_path: onnx_files[0].clone(),
                 tokenizer_path: tokenizer_files[0].clone(),
             });
         }
-        
+
         // Strategy 3: Check if we can convert PyTorch model
-        if files.iter().any(|f| f == "pytorch_model.bin" || f == "model.safetensors") {
+        if files
+            .iter()
+            .any(|f| f == "pytorch_model.bin" || f == "model.safetensors")
+        {
             return Ok(ModelFormat::ConvertToOnnx);
         }
-        
+
         Ok(ModelFormat::Unsupported)
     }
 
@@ -159,54 +194,60 @@ impl ModelDownloader {
     async fn get_repo_files(&self, repo: &str) -> anyhow::Result<Vec<String>> {
         let api_url = format!("https://huggingface.co/api/models/{}", repo);
         let client = reqwest::Client::new();
-        
+
         let mut request = client.get(&api_url);
-        
+
         // Optional authentication
         if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
-        
+
         let response = request.send().await?;
-        
+
         if response.status() == 404 {
             return Err(anyhow!("Model repository '{}' not found", repo));
         }
-        
+
         if response.status() == 401 {
             return Err(anyhow!(
                 "Model '{}' requires authentication. Set HUGGINGFACE_TOKEN environment variable.\n\
-                 Get a token from: https://huggingface.co/settings/tokens", 
+                 Get a token from: https://huggingface.co/settings/tokens",
                 repo
             ));
         }
-        
+
         let repo_info: RepoInfo = response.json().await?;
-        Ok(repo_info.siblings.into_iter().map(|f| f.rfilename).collect())
+        Ok(repo_info
+            .siblings
+            .into_iter()
+            .map(|f| f.rfilename)
+            .collect())
     }
 
     /// Download ONNX files directly from HuggingFace
     async fn download_onnx_files(
         &self,
-        model_name: &str, 
-        model_path: &str, 
+        model_name: &str,
+        model_path: &str,
         tokenizer_path: &str,
         model_info: &ModelInfo,
     ) -> anyhow::Result<()> {
         let base_url = format!("https://huggingface.co/{}/resolve/main/", model_name);
-        
+
         // Download model file
         let model_url = format!("{}{}", base_url, model_path);
         let local_model_path = self.cache_dir.join(&model_info.onnx_filename);
         tracing::info!("📥 Downloading ONNX model from: {}", model_url);
-        self.download_file_with_auth(&model_url, &local_model_path).await?;
-        
+        self.download_file_with_auth(&model_url, &local_model_path)
+            .await?;
+
         // Download tokenizer file
         let tokenizer_url = format!("{}{}", base_url, tokenizer_path);
         let local_tokenizer_path = self.cache_dir.join(&model_info.tokenizer_filename);
         tracing::info!("📥 Downloading tokenizer from: {}", tokenizer_url);
-        self.download_file_with_auth(&tokenizer_url, &local_tokenizer_path).await?;
-        
+        self.download_file_with_auth(&tokenizer_url, &local_tokenizer_path)
+            .await?;
+
         Ok(())
     }
 
@@ -214,20 +255,20 @@ impl ModelDownloader {
     async fn download_file_with_auth(&self, url: &str, local_path: &PathBuf) -> anyhow::Result<()> {
         let client = reqwest::Client::new();
         let mut request = client.get(url);
-        
+
         // Use HF token if available
         if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
-        
+
         let response = request.send().await?;
-        
+
         if response.status() == 401 {
             return Err(anyhow!(
                 "File requires authentication. Set HUGGINGFACE_TOKEN environment variable."
             ));
         }
-        
+
         if !response.status().is_success() {
             return Err(anyhow!(
                 "Failed to download file from {}: HTTP {}",
@@ -235,12 +276,16 @@ impl ModelDownloader {
                 response.status()
             ));
         }
-        
+
         let bytes = response.bytes().await?;
         fs::write(local_path, bytes).await?;
-        
-        tracing::info!("✅ Downloaded: {} ({} bytes)", local_path.display(), fs::metadata(local_path).await?.len());
-        
+
+        tracing::info!(
+            "✅ Downloaded: {} ({} bytes)",
+            local_path.display(),
+            fs::metadata(local_path).await?.len()
+        );
+
         Ok(())
     }
 
@@ -248,18 +293,18 @@ impl ModelDownloader {
         // Set up Python virtual environment with required dependencies
         let venv_dir = self.cache_dir.join("python_venv");
         self.ensure_python_venv(&venv_dir).await?;
-        
+
         let python_script = self.create_conversion_script(model_info).await?;
-        
+
         tracing::info!("Running model conversion script in virtual environment...");
-        
+
         // Use the virtual environment's Python
         let python_exe = if cfg!(windows) {
             venv_dir.join("Scripts").join("python.exe")
         } else {
             venv_dir.join("bin").join("python")
         };
-        
+
         let output = Command::new(&python_exe)
             .arg(&python_script)
             .env("CACHE_DIR", &self.cache_dir)
@@ -294,12 +339,18 @@ impl ModelDownloader {
         if python_exe.exists() {
             // Check if required packages are installed
             let output = Command::new(&python_exe)
-                .args(&["-c", "import torch, transformers, onnx, tokenizers; print('OK')"])
+                .args(&[
+                    "-c",
+                    "import torch, transformers, onnx, tokenizers; print('OK')",
+                ])
                 .output();
-            
+
             if let Ok(output) = output {
-                if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "OK" {
-                    tracing::info!("Python virtual environment already set up with required packages");
+                if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "OK"
+                {
+                    tracing::info!(
+                        "Python virtual environment already set up with required packages"
+                    );
                     return Ok(());
                 }
             }
@@ -309,10 +360,15 @@ impl ModelDownloader {
 
         // Create virtual environment
         fs::create_dir_all(venv_dir).await?;
-        
+
         let output = Command::new("python3")
-            .args(&["-m", "venv", venv_dir.to_str()
-                .ok_or_else(|| anyhow!("Invalid venv directory path"))?])
+            .args(&[
+                "-m",
+                "venv",
+                venv_dir
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid venv directory path"))?,
+            ])
             .output()
             .map_err(|e| anyhow!("Failed to create Python virtual environment: {}", e))?;
 
@@ -330,12 +386,7 @@ impl ModelDownloader {
             venv_dir.join("bin").join("pip")
         };
 
-        let packages = [
-            "torch",
-            "transformers", 
-            "onnx",
-            "tokenizers",
-        ];
+        let packages = ["torch", "transformers", "onnx", "tokenizers"];
 
         for package in &packages {
             tracing::info!("Installing {}...", package);
@@ -518,10 +569,12 @@ if __name__ == "__main__":
 "#
         );
 
-        let script_path = self.cache_dir.join(format!("convert_model_{}.py", 
-            model_info.hf_model_name.replace("/", "_").replace("-", "_")));
+        let script_path = self.cache_dir.join(format!(
+            "convert_model_{}.py",
+            model_info.hf_model_name.replace("/", "_").replace("-", "_")
+        ));
         fs::write(&script_path, script_content).await?;
-        
+
         // Make the script executable
         #[cfg(unix)]
         {

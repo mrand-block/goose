@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
-use mcp_core::tool::ToolCall;
 use crate::conversation::message::Message;
+use anyhow::{anyhow, Result};
+use mcp_core::tool::ToolCall;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -8,7 +8,7 @@ use tokio::sync::OnceCell;
 use crate::security::model_downloader::{get_global_downloader, ModelInfo};
 
 // ML inference backends
-use ort::{session::Session, session::builder::GraphOptimizationLevel};
+use ort::{session::builder::GraphOptimizationLevel, session::Session};
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -33,24 +33,28 @@ pub struct OnnxPromptInjectionModel {
 }
 
 impl OnnxPromptInjectionModel {
-    pub async fn new(model_path: PathBuf, tokenizer_path: PathBuf, model_name: String) -> Result<Self> {
+    pub async fn new(
+        model_path: PathBuf,
+        tokenizer_path: PathBuf,
+        model_name: String,
+    ) -> Result<Self> {
         tracing::info!("🔒 Starting ONNX model initialization...");
-        
+
         // Initialize ONNX Runtime session
         tracing::info!("🔒 Creating ONNX session from: {:?}", model_path);
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(&model_path)?;
-        
+
         tracing::info!("🔒 ONNX session created successfully");
-        
+
         // Load tokenizer
         tracing::info!("🔒 Loading tokenizer from: {:?}", tokenizer_path);
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
-        
+
         tracing::info!("🔒 Tokenizer loaded successfully");
-        
+
         Ok(Self {
             session: Arc::new(std::sync::Mutex::new(session)),
             tokenizer: Arc::new(tokenizer),
@@ -63,71 +67,84 @@ impl OnnxPromptInjectionModel {
 impl PromptInjectionModel for OnnxPromptInjectionModel {
     async fn predict(&self, text: &str) -> Result<(f32, String)> {
         tracing::info!("🔒 ONNX predict() called with text length: {}", text.len());
-        tracing::info!("🔒 ONNX predict() received text: '{}'", text.chars().take(200).collect::<String>());
-        
+        tracing::info!(
+            "🔒 ONNX predict() received text: '{}'",
+            text.chars().take(200).collect::<String>()
+        );
+
         // Tokenize the input text
         tracing::debug!("🔒 Tokenizing input text...");
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-        
+
         let input_ids = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
-        
-        tracing::debug!("🔒 Tokenization complete. Sequence length: {}", input_ids.len());
-        
+
+        tracing::debug!(
+            "🔒 Tokenization complete. Sequence length: {}",
+            input_ids.len()
+        );
+
         // Convert to the format expected by ONNX (batch_size=1)
         let input_ids: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
         let attention_mask: Vec<i64> = attention_mask.iter().map(|&mask| mask as i64).collect();
-        
+
         let seq_len = input_ids.len();
-        
+
         tracing::debug!("🔒 Creating ONNX tensors...");
         // Create ONNX tensors
-        let input_ids_tensor = ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))?;
-        let attention_mask_tensor = ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))?;
-        
+        let input_ids_tensor =
+            ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))?;
+        let attention_mask_tensor =
+            ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))?;
+
         tracing::debug!("🔒 Running ONNX inference...");
         // Run inference and extract the logits immediately
         let (logit_0, logit_1) = {
-            let mut session = self.session.lock().map_err(|e| anyhow!("Failed to lock session: {}", e))?;
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|e| anyhow!("Failed to lock session: {}", e))?;
             tracing::debug!("🔒 Session locked, running inference...");
             let outputs = session.run(ort::inputs![
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor
             ])?;
-            
+
             tracing::debug!("🔒 Inference complete, extracting logits...");
             // Extract logits from output immediately while we have the lock
             let logits = outputs["logits"].try_extract_tensor::<f32>()?;
             let logits_slice = logits.1;
-            
+
             // Extract the values we need
             let logit_0 = logits_slice[0]; // Non-injection class
             let logit_1 = logits_slice[1]; // Injection class
-            
+
             tracing::debug!("🔒 Logits extracted: [{:.3}, {:.3}]", logit_0, logit_1);
-            
+
             (logit_0, logit_1)
         };
-        
+
         // Apply softmax to get probabilities
         let exp_0 = logit_0.exp();
         let exp_1 = logit_1.exp();
         let sum_exp = exp_0 + exp_1;
-        
+
         let prob_injection = exp_1 / sum_exp;
-        
+
         let explanation = format!(
             "ONNX model '{}': Injection probability = {:.3} (logits: [{:.3}, {:.3}])",
             self.model_name, prob_injection, logit_0, logit_1
         );
-        
+
         tracing::info!(
             "🔒 ONNX prediction complete: confidence={:.3}, explanation={}",
-            prob_injection, explanation
+            prob_injection,
+            explanation
         );
-        
+
         tracing::debug!(
             model = %self.model_name,
             text_length = text.len(),
@@ -137,22 +154,23 @@ impl PromptInjectionModel for OnnxPromptInjectionModel {
             prob_injection = prob_injection,
             "ONNX inference completed"
         );
-        
+
         Ok((prob_injection, explanation))
     }
-    
+
     fn model_name(&self) -> &str {
         &self.model_name
     }
 }
 
 /// Global model cache with reload capability
-static MODEL_CACHE: OnceCell<Arc<tokio::sync::RwLock<Option<Arc<dyn PromptInjectionModel>>>>> = OnceCell::const_new();
+static MODEL_CACHE: OnceCell<Arc<tokio::sync::RwLock<Option<Arc<dyn PromptInjectionModel>>>>> =
+    OnceCell::const_new();
 
 /// Initialize the global model
 async fn initialize_model() -> Result<Option<Arc<dyn PromptInjectionModel>>> {
     tracing::info!("🔒 Attempting to initialize ONNX security model...");
-    
+
     // Try to load the ONNX model
     match get_global_downloader().await {
         Ok(downloader) => {
@@ -160,7 +178,13 @@ async fn initialize_model() -> Result<Option<Arc<dyn PromptInjectionModel>>> {
             match downloader.ensure_model_available(&model_info).await {
                 Ok((model_path, tokenizer_path)) => {
                     tracing::info!("🔒 Loading ONNX model from: {:?}", model_path);
-                    match OnnxPromptInjectionModel::new(model_path, tokenizer_path, model_info.hf_model_name.clone()).await {
+                    match OnnxPromptInjectionModel::new(
+                        model_path,
+                        tokenizer_path,
+                        model_info.hf_model_name.clone(),
+                    )
+                    .await
+                    {
                         Ok(model) => {
                             tracing::info!("🔒 ✅ ONNX security model loaded successfully");
                             return Ok(Some(Arc::new(model)));
@@ -179,7 +203,7 @@ async fn initialize_model() -> Result<Option<Arc<dyn PromptInjectionModel>>> {
             tracing::warn!("🔒 Failed to get model downloader: {}", e);
         }
     }
-    
+
     tracing::info!("🔒 ONNX model not available, will use pattern-based scanning");
     Ok(None)
 }
@@ -187,11 +211,9 @@ async fn initialize_model() -> Result<Option<Arc<dyn PromptInjectionModel>>> {
 /// Get or initialize the global model
 async fn get_model() -> Option<Arc<dyn PromptInjectionModel>> {
     let cache = MODEL_CACHE
-        .get_or_init(|| async { 
-            Arc::new(tokio::sync::RwLock::new(None))
-        })
+        .get_or_init(|| async { Arc::new(tokio::sync::RwLock::new(None)) })
         .await;
-    
+
     // Check if model is already loaded in memory
     let read_guard = cache.read().await;
     if let Some(model) = read_guard.as_ref() {
@@ -199,17 +221,17 @@ async fn get_model() -> Option<Arc<dyn PromptInjectionModel>> {
         return Some(model.clone());
     }
     drop(read_guard);
-    
+
     // Model not loaded in memory, try to initialize from disk
     tracing::info!("🔒 Model not loaded in memory, loading from disk cache...");
     let mut write_guard = cache.write().await;
-    
+
     // Double-check in case another task loaded it while we were waiting
     if let Some(model) = write_guard.as_ref() {
         tracing::debug!("🔒 Model was loaded by another task while waiting, using that instance");
         return Some(model.clone());
     }
-    
+
     // Load the model from disk
     match initialize_model().await {
         Ok(Some(model)) => {
@@ -231,11 +253,9 @@ async fn get_model() -> Option<Arc<dyn PromptInjectionModel>> {
 /// Check if model is available without triggering download/initialization
 pub async fn get_model_if_available() -> Option<Arc<dyn PromptInjectionModel>> {
     let cache = MODEL_CACHE
-        .get_or_init(|| async { 
-            Arc::new(tokio::sync::RwLock::new(None))
-        })
+        .get_or_init(|| async { Arc::new(tokio::sync::RwLock::new(None)) })
         .await;
-    
+
     // Only check if model is already loaded in memory - don't trigger loading
     let read_guard = cache.read().await;
     read_guard.as_ref().cloned()
@@ -250,14 +270,14 @@ pub struct PromptInjectionScanner {
 impl PromptInjectionScanner {
     pub fn new() -> Self {
         println!("🔒 PromptInjectionScanner::new() called");
-        
+
         // Check if models are available, trigger download if needed
         let scanner = Self {
             enabled: Self::check_and_prepare_models(),
         };
-        
+
         println!("🔒 Scanner enabled: {}", scanner.enabled);
-        
+
         scanner
     }
 
@@ -265,34 +285,40 @@ impl PromptInjectionScanner {
     fn check_and_prepare_models() -> bool {
         // Check if models are already cached
         let model_info = Self::get_model_info_from_config();
-        
+
         // Check if model files exist in cache
         if let Some(cache_dir) = dirs::cache_dir() {
             let security_models_dir = cache_dir.join("goose").join("security_models");
             let model_path = security_models_dir.join(&model_info.onnx_filename);
             let tokenizer_path = security_models_dir.join(&model_info.tokenizer_filename);
-            
+
             if model_path.exists() && tokenizer_path.exists() {
-                tracing::info!("🔒 Security model files found on disk - loading model into memory now...");
-                
+                tracing::info!(
+                    "🔒 Security model files found on disk - loading model into memory now..."
+                );
+
                 // Load model into memory immediately at startup
                 tokio::spawn(async move {
                     tracing::info!("🔒 Pre-loading security model at startup...");
                     if let Some(_model) = get_model().await {
-                        tracing::info!("🔒 ✅ Security model pre-loaded successfully - ready for scanning");
+                        tracing::info!(
+                            "🔒 ✅ Security model pre-loaded successfully - ready for scanning"
+                        );
                     } else {
                         tracing::warn!("🔒 Failed to pre-load security model");
                     }
                 });
-                
+
                 return true;
             }
         }
-        
+
         // Models not cached - we need to download them
         tracing::info!("🔒 Security model files not found on disk");
-        tracing::info!("🔒 Models will be downloaded on first security scan (this may cause a delay)");
-        
+        tracing::info!(
+            "🔒 Models will be downloaded on first security scan (this may cause a delay)"
+        );
+
         // For now, return true to enable security scanning
         // The models will be downloaded lazily on first scan
         // TODO: Consider blocking startup to download models synchronously
@@ -302,7 +328,7 @@ impl PromptInjectionScanner {
     /// Ensure models are available using the existing model_downloader
     async fn ensure_models_available() {
         tracing::info!("🔒 Ensuring security models are available...");
-        
+
         match get_global_downloader().await {
             Ok(downloader) => {
                 let model_info = Self::get_model_info_from_config();
@@ -310,7 +336,8 @@ impl PromptInjectionScanner {
                     Ok((model_path, tokenizer_path)) => {
                         tracing::info!(
                             "🔒 ✅ Security models ready: model={:?}, tokenizer={:?}",
-                            model_path, tokenizer_path
+                            model_path,
+                            tokenizer_path
                         );
                     }
                     Err(e) => {
@@ -329,17 +356,19 @@ impl PromptInjectionScanner {
     pub fn get_model_info_from_config() -> ModelInfo {
         use crate::config::Config;
         let config = Config::global();
-        
+
         // Try to get model from config
         let security_config = config.get_param::<serde_json::Value>("security").ok();
-        
+
         let model_name = security_config
             .as_ref()
             .and_then(|security| security.get("models")?.as_array()?.first())
             .and_then(|model| model.get("model")?.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                tracing::warn!("🔒 No security model configured, security scanning will be disabled");
+                tracing::warn!(
+                    "🔒 No security model configured, security scanning will be disabled"
+                );
                 // Return a placeholder that won't work, forcing pattern-only mode
                 "no-model-configured".to_string()
             });
@@ -358,7 +387,7 @@ impl PromptInjectionScanner {
     ) -> Result<ScanResult> {
         // Step 1: Scan the tool call itself for suspicious patterns
         let tool_call_result = self.scan_tool_call_only(tool_call).await?;
-        
+
         if !tool_call_result.is_malicious {
             // Tool call looks safe, no need for context analysis
             tracing::debug!(
@@ -368,23 +397,20 @@ impl PromptInjectionScanner {
             );
             return Ok(tool_call_result);
         }
-        
+
         // Step 2: Tool call looks suspicious, analyze conversation context
         tracing::info!(
             tool_name = %tool_call.name,
             confidence = tool_call_result.confidence,
             "🔍 Tool call flagged as suspicious, analyzing conversation context"
         );
-        
+
         let user_messages_result = self.scan_user_messages_only(messages).await?;
-        
+
         // Decision logic: combine both results
-        let final_result = self.make_final_security_decision(
-            &tool_call_result,
-            &user_messages_result,
-            tool_call,
-        );
-        
+        let final_result =
+            self.make_final_security_decision(&tool_call_result, &user_messages_result, tool_call);
+
         tracing::info!(
             tool_name = %tool_call.name,
             tool_confidence = tool_call_result.confidence,
@@ -393,7 +419,7 @@ impl PromptInjectionScanner {
             final_confidence = final_result.confidence,
             "🔒 Two-step security analysis complete"
         );
-        
+
         Ok(final_result)
     }
 
@@ -401,23 +427,21 @@ impl PromptInjectionScanner {
     async fn scan_tool_call_only(&self, tool_call: &ToolCall) -> Result<ScanResult> {
         // Debug: Log the raw tool call arguments first
         tracing::info!("🔒 Raw tool call arguments: {:?}", tool_call.arguments);
-        
+
         // Create text representation of the tool call for analysis
-        let arguments_json = serde_json::to_string_pretty(&tool_call.arguments)
-            .unwrap_or_else(|e| {
+        let arguments_json =
+            serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_else(|e| {
                 tracing::warn!("🔒 Failed to serialize tool arguments: {}", e);
                 format!("{{\"error\": \"Failed to serialize arguments: {}\"}}", e)
             });
-        
-        let tool_text = format!(
-            "Tool: {}\nArguments: {}",
-            tool_call.name,
-            arguments_json
-        );
 
-        tracing::info!("🔒 Complete tool text being analyzed (length: {}): '{}'", 
-                      tool_text.len(), 
-                      tool_text);
+        let tool_text = format!("Tool: {}\nArguments: {}", tool_call.name, arguments_json);
+
+        tracing::info!(
+            "🔒 Complete tool text being analyzed (length: {}): '{}'",
+            tool_text.len(),
+            tool_text
+        );
 
         self.scan_with_prompt_injection_model(&tool_text).await
     }
@@ -463,29 +487,27 @@ impl PromptInjectionScanner {
         // 1. If user messages contain prompt injection, tool call is likely malicious
         // 2. If user messages are clean but tool call is suspicious, it might be a legitimate response
         // 3. Consider tool risk level as well
-        
+
         let tool_risk = self.assess_tool_risk(&tool_call.name);
-        
+
         let (is_malicious, confidence, explanation) = if user_messages_result.is_malicious {
             // User messages contain prompt injection - tool call is likely malicious
-            let combined_confidence = (tool_call_result.confidence + user_messages_result.confidence) / 2.0;
-            let explanation = format!(
-                "Tool appears to be the result of a prompt injection attack."
-            );
+            let combined_confidence =
+                (tool_call_result.confidence + user_messages_result.confidence) / 2.0;
+            let explanation =
+                format!("Tool appears to be the result of a prompt injection attack.");
             (true, combined_confidence.max(0.8), explanation)
         } else {
             // User messages are clean - suspicious tool call might be legitimate
             // Lower the confidence since user didn't inject malicious prompts
             let adjusted_confidence = tool_call_result.confidence * 0.6; // Reduce confidence
-            let explanation = format!(
-                "Tool flagged as suspicious but user messages appear clean."
-            );
-            
+            let explanation = format!("Tool flagged as suspicious but user messages appear clean.");
+
             // Only consider malicious if adjusted confidence is still high AND tool is high-risk
             let is_malicious = adjusted_confidence > 0.7 && tool_risk > 0.6;
             (is_malicious, adjusted_confidence, explanation)
         };
-        
+
         ScanResult {
             is_malicious,
             confidence,
@@ -511,38 +533,50 @@ impl PromptInjectionScanner {
 
     /// Model-agnostic prompt injection scanning
     async fn scan_with_prompt_injection_model(&self, text: &str) -> Result<ScanResult> {
-        tracing::info!("🔒 Starting scan_with_prompt_injection_model for text (length: {}): '{}'", 
-                      text.len(), 
-                      text.chars().take(100).collect::<String>());
-        
+        tracing::info!(
+            "🔒 Starting scan_with_prompt_injection_model for text (length: {}): '{}'",
+            text.len(),
+            text.chars().take(100).collect::<String>()
+        );
+
         // Always run pattern-based scanning first
         let pattern_result = self.scan_with_patterns(text).await?;
-        
+
         // Try to get the ML model for additional scanning
         tracing::info!("🔒 Attempting to get ML model...");
         if let Some(model) = get_model().await {
             tracing::info!("🔒 ML model retrieved successfully, calling predict...");
-            tracing::info!("🔒 About to call model.predict() with text length: {}", text.len());
+            tracing::info!(
+                "🔒 About to call model.predict() with text length: {}",
+                text.len()
+            );
             match model.predict(text).await {
                 Ok((ml_confidence, ml_explanation)) => {
                     tracing::info!("🔒 ML model predict returned successfully");
                     // Get threshold from config
                     let threshold = self.get_threshold_from_config();
                     let ml_is_malicious = ml_confidence > threshold;
-                    
+
                     tracing::info!(
                         "🔒 ML model prediction: confidence={:.3}, threshold={:.3}, malicious={}",
-                        ml_confidence, threshold, ml_is_malicious
+                        ml_confidence,
+                        threshold,
+                        ml_is_malicious
                     );
-                    
+
                     // Combine ML and pattern results
-                    let combined_result = self.combine_scan_results(&pattern_result, ml_confidence, &ml_explanation, ml_is_malicious);
-                    
+                    let combined_result = self.combine_scan_results(
+                        &pattern_result,
+                        ml_confidence,
+                        &ml_explanation,
+                        ml_is_malicious,
+                    );
+
                     tracing::info!(
                         "🔒 Combined scan result: ML confidence={:.3}, Pattern confidence={:.3}, Final confidence={:.3}, Final malicious={}",
                         ml_confidence, pattern_result.confidence, combined_result.confidence, combined_result.is_malicious
                     );
-                    
+
                     return Ok(combined_result);
                 }
                 Err(e) => {
@@ -553,43 +587,53 @@ impl PromptInjectionScanner {
         } else {
             tracing::info!("🔒 No ML model available, using pattern-based scanning only");
         }
-        
+
         tracing::info!("🔒 Using pattern-based scan result only");
         Ok(pattern_result)
     }
-    
+
     /// Combine ML model and pattern matching results
-    fn combine_scan_results(&self, pattern_result: &ScanResult, ml_confidence: f32, ml_explanation: &str, ml_is_malicious: bool) -> ScanResult {
+    fn combine_scan_results(
+        &self,
+        pattern_result: &ScanResult,
+        ml_confidence: f32,
+        ml_explanation: &str,
+        ml_is_malicious: bool,
+    ) -> ScanResult {
         // Take the higher confidence score
         let final_confidence = pattern_result.confidence.max(ml_confidence);
-        
+
         // Mark as malicious if either method detects it
         let final_is_malicious = pattern_result.is_malicious || ml_is_malicious;
-        
+
         // Simplified explanation - just show what detected the threat
         let combined_explanation = if pattern_result.is_malicious && ml_is_malicious {
             "Detected by both pattern analysis and ML model".to_string()
         } else if pattern_result.is_malicious {
-            format!("Detected by pattern analysis: {}", 
-                   pattern_result.explanation.replace("Pattern-based detection: ", ""))
+            format!(
+                "Detected by pattern analysis: {}",
+                pattern_result
+                    .explanation
+                    .replace("Pattern-based detection: ", "")
+            )
         } else if ml_is_malicious {
             "Detected by machine learning model".to_string()
         } else {
             "No threats detected".to_string()
         };
-        
+
         ScanResult {
             is_malicious: final_is_malicious,
             confidence: final_confidence,
             explanation: combined_explanation,
         }
     }
-    
+
     /// Get threshold from config
     fn get_threshold_from_config(&self) -> f32 {
         use crate::config::Config;
         let config = Config::global();
-        
+
         // Get security config and extract threshold
         if let Ok(security_value) = config.get_param::<serde_json::Value>("security") {
             if let Some(models_array) = security_value.get("models").and_then(|m| m.as_array()) {
@@ -600,14 +644,14 @@ impl PromptInjectionScanner {
                 }
             }
         }
-        
+
         0.7 // Default threshold
     }
 
     /// Fallback pattern-based scanning
     async fn scan_with_patterns(&self, text: &str) -> Result<ScanResult> {
         let text_lower = text.to_lowercase();
-        
+
         // Command injection patterns - detect potentially dangerous commands
         let dangerous_patterns = [
             // File system operations
@@ -618,7 +662,6 @@ impl PromptInjectionScanner {
             "rmdir /",
             "del /s /q",
             "format c:",
-            
             // System manipulation
             "shutdown",
             "reboot",
@@ -626,7 +669,6 @@ impl PromptInjectionScanner {
             "poweroff",
             "kill -9",
             "killall",
-            
             // Network/data exfiltration
             "curl http",
             "wget http",
@@ -635,13 +677,11 @@ impl PromptInjectionScanner {
             "ssh ",
             "scp ",
             "rsync",
-            
             // Process manipulation
             "sudo ",
             "su -",
             "chmod 777",
             "chown root",
-            
             // Command chaining that could hide malicious intent
             "; rm ",
             "&& rm ",
@@ -651,7 +691,6 @@ impl PromptInjectionScanner {
             "| curl ",
             "; wget ",
             "&& wget ",
-            
             // Suspicious file operations
             "rm -f /",
             "rm -rf .",
@@ -659,56 +698,54 @@ impl PromptInjectionScanner {
             "> /dev/",
             "dd if=",
             "mkfs",
-            
             // Potential data theft
             "cat /etc/passwd",
             "cat /etc/shadow",
             "/etc/hosts",
             "~/.ssh/",
             "id_rsa",
-            
             // Obfuscation attempts
             "base64 -d",
             "echo | sh",
             "eval ",
             "exec ",
         ];
-        
+
         let mut detected_patterns = Vec::new();
         let mut max_risk_score: f32 = 0.0;
-        
+
         for pattern in &dangerous_patterns {
             if text_lower.contains(pattern) {
                 detected_patterns.push(pattern.to_string());
-                
+
                 // Assign risk scores based on severity
                 let risk_score = match *pattern {
                     // Critical - system destruction
                     "rm -rf /" | "rm -rf /*" | "format c:" | "mkfs" => 0.95,
                     "rm -rf ~" | "rm -rf $home" => 0.90,
-                    
+
                     // High - system control
                     "shutdown" | "reboot" | "halt" | "poweroff" => 0.85,
                     "sudo " | "su -" | "chmod 777" | "chown root" => 0.80,
-                    
+
                     // Medium-High - network/data access
                     "curl http" | "wget http" | "ssh " | "scp " => 0.75,
                     "cat /etc/passwd" | "cat /etc/shadow" | "~/.ssh/" => 0.85,
-                    
+
                     // Medium - suspicious operations
                     "; rm " | "&& rm " | "| rm " => 0.70,
                     "kill -9" | "killall" => 0.65,
-                    
+
                     // Lower - potentially legitimate but suspicious
                     "base64 -d" | "eval " | "exec " => 0.60,
-                    
+
                     _ => 0.50,
                 };
-                
+
                 max_risk_score = max_risk_score.max(risk_score);
             }
         }
-        
+
         if !detected_patterns.is_empty() {
             let is_malicious = max_risk_score > 0.7;
             let explanation = format!(
@@ -717,13 +754,13 @@ impl PromptInjectionScanner {
                 detected_patterns.join(", "),
                 max_risk_score
             );
-            
+
             tracing::info!(
                 "🔒 Pattern-based scan detected {} suspicious patterns with max risk score: {:.2}",
                 detected_patterns.len(),
                 max_risk_score
             );
-            
+
             Ok(ScanResult {
                 is_malicious,
                 confidence: max_risk_score,
@@ -733,7 +770,8 @@ impl PromptInjectionScanner {
             Ok(ScanResult {
                 is_malicious: false,
                 confidence: 0.0,
-                explanation: "Pattern-based scan: No suspicious command patterns detected".to_string(),
+                explanation: "Pattern-based scan: No suspicious command patterns detected"
+                    .to_string(),
             })
         }
     }
