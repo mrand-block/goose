@@ -481,32 +481,32 @@ impl PromptInjectionScanner {
         &self,
         tool_call_result: &ScanResult,
         user_messages_result: &ScanResult,
-        tool_call: &ToolCall,
+        _tool_call: &ToolCall,
     ) -> ScanResult {
-        // Decision logic:
+        // Simple decision logic using config threshold:
         // 1. If user messages contain prompt injection, tool call is likely malicious
-        // 2. If user messages are clean but tool call is suspicious, it might be a legitimate response
-        // 3. Consider tool risk level as well
+        // 2. Otherwise, use the tool call confidence as-is
+        // 3. Let the config threshold determine if user should be asked
 
-        let tool_risk = self.assess_tool_risk(&tool_call.name);
-
-        let (is_malicious, confidence, explanation) = if user_messages_result.is_malicious {
+        let (confidence, explanation) = if user_messages_result.is_malicious {
             // User messages contain prompt injection - tool call is likely malicious
             let combined_confidence =
                 (tool_call_result.confidence + user_messages_result.confidence) / 2.0;
-            let explanation =
-                format!("Tool appears to be the result of a prompt injection attack.");
-            (true, combined_confidence.max(0.8), explanation)
+            let explanation = "Tool appears to be the result of a prompt injection attack.".to_string();
+            (combined_confidence, explanation)
         } else {
-            // User messages are clean - suspicious tool call might be legitimate
-            // Lower the confidence since user didn't inject malicious prompts
-            let adjusted_confidence = tool_call_result.confidence * 0.6; // Reduce confidence
-            let explanation = format!("Tool flagged as suspicious but user messages appear clean.");
-
-            // Only consider malicious if adjusted confidence is still high AND tool is high-risk
-            let is_malicious = adjusted_confidence > 0.7 && tool_risk > 0.6;
-            (is_malicious, adjusted_confidence, explanation)
+            // Use tool call confidence as-is, let config threshold decide
+            let explanation = if tool_call_result.confidence > 0.0 {
+                format!("Tool flagged with confidence: {:.2}", tool_call_result.confidence)
+            } else {
+                "Tool appears safe".to_string()
+            };
+            (tool_call_result.confidence, explanation)
         };
+
+        // Get threshold from config to determine if malicious
+        let config_threshold = self.get_threshold_from_config();
+        let is_malicious = confidence > config_threshold;
 
         ScanResult {
             is_malicious,
@@ -597,7 +597,7 @@ impl PromptInjectionScanner {
         &self,
         pattern_result: &ScanResult,
         ml_confidence: f32,
-        ml_explanation: &str,
+        _ml_explanation: &str,
         ml_is_malicious: bool,
     ) -> ScanResult {
         // Take the higher confidence score
@@ -630,7 +630,7 @@ impl PromptInjectionScanner {
     }
 
     /// Get threshold from config
-    fn get_threshold_from_config(&self) -> f32 {
+    pub fn get_threshold_from_config(&self) -> f32 {
         use crate::config::Config;
         let config = Config::global();
 
@@ -747,7 +747,9 @@ impl PromptInjectionScanner {
         }
 
         if !detected_patterns.is_empty() {
-            let is_malicious = max_risk_score > 0.7;
+            // Use config threshold for pattern-based detection too
+            let config_threshold = self.get_threshold_from_config();
+            let is_malicious = max_risk_score > config_threshold;
             let explanation = format!(
                 "Pattern-based detection: Found {} suspicious command pattern(s): [{}]. Risk score: {:.2}",
                 detected_patterns.len(),

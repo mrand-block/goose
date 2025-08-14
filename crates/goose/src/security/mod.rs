@@ -81,13 +81,12 @@ impl SecurityManager {
 
         let mut results = Vec::new();
 
-        // Collect ALL tool requests (approved + needs_approval) for security scanning
-        let mut all_tool_requests = Vec::new();
-        all_tool_requests.extend(&permission_check_result.approved);
-        all_tool_requests.extend(&permission_check_result.needs_approval);
-
-        // Check ALL tools for potential security issues
-        for tool_request in &all_tool_requests {
+        // Check ALL tools (approved + needs_approval) for potential security issues
+        for tool_request in permission_check_result
+            .approved
+            .iter()
+            .chain(permission_check_result.needs_approval.iter())
+        {
             if let Ok(tool_call) = &tool_request.tool_call {
                 tracing::info!(
                     tool_name = %tool_call.name,
@@ -107,11 +106,14 @@ impl SecurityManager {
                         "🚨 Tool call flagged as malicious after two-step analysis"
                     );
 
+                    // Get threshold from config - if confidence > threshold, ask user
+                    let config_threshold = scanner.get_threshold_from_config();
+                    
                     results.push(SecurityResult {
                         is_malicious: analysis_result.is_malicious,
                         confidence: analysis_result.confidence,
                         explanation: analysis_result.explanation,
-                        should_ask_user: analysis_result.confidence > 0.7,
+                        should_ask_user: analysis_result.confidence > config_threshold,
                     });
                 } else {
                     tracing::debug!(
