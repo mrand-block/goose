@@ -1328,7 +1328,8 @@ impl Agent {
                     tool_request_id = %request_id,
                     confidence = security_result.confidence,
                     explanation = %security_result.explanation,
-                    "Security threat detected - modifying tool approval status"
+                    finding_id = %security_result.finding_id,
+                    "🔒 Security threat detected - modifying tool approval status"
                 );
 
                 // Remove from approved if present

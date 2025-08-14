@@ -163,9 +163,10 @@ impl PromptInjectionModel for OnnxPromptInjectionModel {
     }
 }
 
+type ModelCache = Arc<tokio::sync::RwLock<Option<Arc<dyn PromptInjectionModel>>>>;
+
 /// Global model cache with reload capability
-static MODEL_CACHE: OnceCell<Arc<tokio::sync::RwLock<Option<Arc<dyn PromptInjectionModel>>>>> =
-    OnceCell::const_new();
+static MODEL_CACHE: OnceCell<ModelCache> = OnceCell::const_new();
 
 /// Initialize the global model
 async fn initialize_model() -> Result<Option<Arc<dyn PromptInjectionModel>>> {

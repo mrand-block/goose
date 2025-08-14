@@ -18,6 +18,7 @@ pub struct SecurityResult {
     pub confidence: f32,
     pub explanation: String,
     pub should_ask_user: bool,
+    pub finding_id: String,
 }
 
 impl SecurityManager {
@@ -99,11 +100,15 @@ impl SecurityManager {
                     .await?;
 
                 if analysis_result.is_malicious {
+                    // Generate a unique finding ID for this security detection
+                    let finding_id = format!("SEC-{}", uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8].to_string());
+                    
                     tracing::warn!(
                         tool_name = %tool_call.name,
                         confidence = analysis_result.confidence,
                         explanation = %analysis_result.explanation,
-                        "🚨 Tool call flagged as malicious after two-step analysis"
+                        finding_id = %finding_id,
+                        "🔒 Tool call flagged as malicious after two-step analysis"
                     );
 
                     // Get threshold from config - if confidence > threshold, ask user
@@ -114,6 +119,7 @@ impl SecurityManager {
                         confidence: analysis_result.confidence,
                         explanation: analysis_result.explanation,
                         should_ask_user: analysis_result.confidence > config_threshold,
+                        finding_id,
                     });
                 } else {
                     tracing::debug!(

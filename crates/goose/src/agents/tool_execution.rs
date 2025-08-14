@@ -87,10 +87,12 @@ impl Agent {
                     let confirmation_prompt = if let Some(security_result) = security_context {
                         format!(
                             "🚨 SECURITY WARNING: This tool call has been flagged as potentially malicious.\n\
+                            Finding ID: {}\n\
                             Confidence: {:.1}%\n\
                             Reason: {}\n\n\
                             Goose would still like to call the above tool. \n\
                             Please review carefully. Allow? (y/n):",
+                            security_result.finding_id,
                             security_result.confidence * 100.0,
                             security_result.explanation
                         )
@@ -109,6 +111,42 @@ impl Agent {
                     let mut rx = self.confirmation_rx.lock().await;
                     while let Some((req_id, confirmation)) = rx.recv().await {
                         if req_id == request.id {
+                            // Log user decision, especially for security-flagged tools
+                            if let Some(security_result) = security_context {
+                                match confirmation.permission {
+                                    Permission::AllowOnce | Permission::AlwaysAllow => {
+                                        tracing::warn!(
+                                            tool_name = %tool_call.name,
+                                            request_id = %request.id,
+                                            permission = ?confirmation.permission,
+                                            security_confidence = %format!("{:.1}%", security_result.confidence * 100.0),
+                                            security_reason = %security_result.explanation,
+                                            finding_id = %security_result.finding_id,
+                                            "🔒 USER APPROVED security-flagged tool despite warning"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::info!(
+                                            tool_name = %tool_call.name,
+                                            request_id = %request.id,
+                                            permission = ?confirmation.permission,
+                                            security_confidence = %format!("{:.1}%", security_result.confidence * 100.0),
+                                            security_reason = %security_result.explanation,
+                                            finding_id = %security_result.finding_id,
+                                            "🔒 USER DENIED security-flagged tool"
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Log regular tool decisions at debug level
+                                tracing::debug!(
+                                    tool_name = %tool_call.name,
+                                    request_id = %request.id,
+                                    permission = ?confirmation.permission,
+                                    "🔒 User decision for tool execution"
+                                );
+                            }
+
                             if confirmation.permission == Permission::AllowOnce || confirmation.permission == Permission::AlwaysAllow {
                                 let (req_id, tool_result) = self.dispatch_tool_call(tool_call.clone(), request.id.clone(), cancellation_token.clone()).await;
                                 let mut futures = tool_futures.lock().await;
