@@ -70,10 +70,12 @@ impl SecurityManager {
     /// Main security check function - called from reply_internal
     /// Uses the proper two-step security analysis process
     /// Scans ALL tools (approved + needs_approval) for security threats
+    /// Also scans system prompt if provided for persistent injection attacks
     pub async fn filter_malicious_tool_calls(
         &self,
         messages: &[Message],
         permission_check_result: &PermissionCheckResult,
+        system_prompt: Option<&str>,
     ) -> Result<Vec<SecurityResult>> {
         let Some(scanner) = &self.scanner else {
             // Security disabled, return empty results
@@ -81,6 +83,36 @@ impl SecurityManager {
         };
 
         let mut results = Vec::new();
+
+        // First, scan system prompt if provided for persistent injection attacks
+        if let Some(system_prompt) = system_prompt {
+            tracing::info!("🔍 Scanning system prompt for persistent injection attacks");
+            
+            let system_prompt_result = scanner.scan_system_prompt(system_prompt).await?;
+            
+            if system_prompt_result.is_malicious {
+                let finding_id = format!("SYS-{}", uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8].to_string());
+                
+                tracing::warn!(
+                    confidence = system_prompt_result.confidence,
+                    explanation = %system_prompt_result.explanation,
+                    finding_id = %finding_id,
+                    "🔒 System prompt contains persistent injection attack"
+                );
+
+                let config_threshold = scanner.get_threshold_from_config();
+                
+                results.push(SecurityResult {
+                    is_malicious: system_prompt_result.is_malicious,
+                    confidence: system_prompt_result.confidence,
+                    explanation: format!("System prompt injection: {}", system_prompt_result.explanation),
+                    should_ask_user: system_prompt_result.confidence > config_threshold,
+                    finding_id,
+                });
+            } else {
+                tracing::debug!("✅ System prompt passed security analysis");
+            }
+        }
 
         // Check ALL tools (approved + needs_approval) for potential security issues
         for tool_request in permission_check_result

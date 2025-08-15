@@ -1096,7 +1096,7 @@ impl Agent {
 
                                     println!("🔍 DEBUG: About to call security manager with {} total tools", remaining_requests.len());
                                     let security_results = self.security_manager
-                                        .filter_malicious_tool_calls(messages.messages(), &initial_permission_result)
+                                        .filter_malicious_tool_calls(messages.messages(), &initial_permission_result, Some(&system_prompt))
                                         .await
                                         .unwrap_or_else(|e| {
                                             tracing::warn!("Security scanning failed: {}", e);
