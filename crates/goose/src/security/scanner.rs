@@ -532,6 +532,17 @@ impl PromptInjectionScanner {
         self.scan_user_messages_only(messages).await
     }
 
+    /// Scan system prompt for persistent injection attacks
+    pub async fn scan_system_prompt(&self, system_prompt: &str) -> Result<ScanResult> {
+        tracing::info!(
+            "🔒 Scanning system prompt for persistent injection attacks (length: {})",
+            system_prompt.len()
+        );
+
+        // Use the ML model to scan the system prompt - this is what we have the model for!
+        self.scan_with_prompt_injection_model(system_prompt).await
+    }
+
     /// Model-agnostic prompt injection scanning
     async fn scan_with_prompt_injection_model(&self, text: &str) -> Result<ScanResult> {
         tracing::info!(
@@ -670,7 +681,11 @@ impl PromptInjectionScanner {
             "poweroff",
             "kill -9",
             "killall",
-            // Network/data exfiltration
+            // Network/data exfiltration and remote execution
+            "bash <(curl",
+            "sh <(curl",
+            "bash <(wget",
+            "sh <(wget",
             "curl http",
             "wget http",
             "nc -l",
@@ -724,6 +739,9 @@ impl PromptInjectionScanner {
                     // Critical - system destruction
                     "rm -rf /" | "rm -rf /*" | "format c:" | "mkfs" => 0.95,
                     "rm -rf ~" | "rm -rf $home" => 0.90,
+
+                    // Critical - remote code execution patterns
+                    "bash <(curl" | "sh <(curl" | "bash <(wget" | "sh <(wget" => 0.95,
 
                     // High - system control
                     "shutdown" | "reboot" | "halt" | "poweroff" => 0.85,
