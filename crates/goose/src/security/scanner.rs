@@ -326,32 +326,7 @@ impl PromptInjectionScanner {
         true
     }
 
-    /// Ensure models are available using the existing model_downloader
-    async fn ensure_models_available() {
-        tracing::info!("🔒 Ensuring security models are available...");
 
-        match get_global_downloader().await {
-            Ok(downloader) => {
-                let model_info = Self::get_model_info_from_config();
-                match downloader.ensure_model_available(&model_info).await {
-                    Ok((model_path, tokenizer_path)) => {
-                        tracing::info!(
-                            "🔒 ✅ Security models ready: model={:?}, tokenizer={:?}",
-                            model_path,
-                            tokenizer_path
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("🔒 Failed to ensure models available: {}", e);
-                        tracing::info!("🔒 Continuing with pattern-based security scanning");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("🔒 Failed to get model downloader: {}", e);
-            }
-        }
-    }
 
     /// Get model information from config file
     pub fn get_model_info_from_config() -> ModelInfo {
@@ -415,7 +390,7 @@ impl PromptInjectionScanner {
         tracing::info!(
             tool_name = %tool_call.name,
             tool_confidence = tool_call_result.confidence,
-            user_confidence = user_messages_result.confidence,
+            conversation_confidence = user_messages_result.confidence,
             final_malicious = final_result.is_malicious,
             final_confidence = final_result.confidence,
             "🔒 Two-step security analysis complete"
@@ -516,21 +491,7 @@ impl PromptInjectionScanner {
         }
     }
 
-    /// Legacy method for backward compatibility - now delegates to two-step analysis
-    pub async fn scan_tool_call(&self, tool_call: &ToolCall) -> Result<ScanResult> {
-        // For backward compatibility, just scan the tool call without context
-        self.scan_tool_call_only(tool_call).await
-    }
 
-    /// Legacy method for backward compatibility - now delegates to user message scanning
-    pub async fn analyze_conversation_context(
-        &self,
-        messages: &[Message],
-        _tool_call: &ToolCall, // Ignored in new implementation
-    ) -> Result<ScanResult> {
-        // For backward compatibility, just scan user messages
-        self.scan_user_messages_only(messages).await
-    }
 
     /// Scan system prompt for persistent injection attacks
     pub async fn scan_system_prompt(&self, system_prompt: &str) -> Result<ScanResult> {
@@ -543,8 +504,8 @@ impl PromptInjectionScanner {
         self.scan_with_prompt_injection_model(system_prompt).await
     }
 
-    /// Model-agnostic prompt injection scanning
-    async fn scan_with_prompt_injection_model(&self, text: &str) -> Result<ScanResult> {
+    /// Model-agnostic prompt injection scanning - public for recipe scanning
+    pub async fn scan_with_prompt_injection_model(&self, text: &str) -> Result<ScanResult> {
         tracing::info!(
             "🔒 Starting scan_with_prompt_injection_model for text (length: {}): '{}'",
             text.len(),
@@ -797,17 +758,7 @@ impl PromptInjectionScanner {
         }
     }
 
-    /// Assess inherent risk of specific tools
-    fn assess_tool_risk(&self, tool_name: &str) -> f32 {
-        // Higher risk tools that could be used maliciously
-        match tool_name {
-            name if name.contains("shell") || name.contains("exec") => 0.8,
-            name if name.contains("file") && name.contains("write") => 0.6,
-            name if name.contains("network") || name.contains("http") => 0.5,
-            name if name.contains("read") => 0.3,
-            _ => 0.1,
-        }
-    }
+
 }
 
 impl Default for PromptInjectionScanner {
