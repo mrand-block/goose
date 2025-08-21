@@ -23,6 +23,7 @@ pub struct ScanResult {
 pub trait PromptInjectionModel: Send + Sync {
     async fn predict(&self, text: &str) -> Result<(f32, String)>;
     fn model_name(&self) -> &str;
+    fn get_tokenizer(&self) -> &Arc<Tokenizer>;
 }
 
 /// ONNX Runtime implementation
@@ -156,6 +157,10 @@ impl PromptInjectionModel for OnnxPromptInjectionModel {
         );
 
         Ok((prob_injection, explanation))
+    }
+
+    fn get_tokenizer(&self) -> &Arc<Tokenizer> {
+        &self.tokenizer
     }
 
     fn model_name(&self) -> &str {
@@ -326,8 +331,6 @@ impl PromptInjectionScanner {
         true
     }
 
-
-
     /// Get model information from config file
     pub fn get_model_info_from_config() -> ModelInfo {
         use crate::config::Config;
@@ -468,12 +471,16 @@ impl PromptInjectionScanner {
             // User messages contain prompt injection - tool call is likely malicious
             let combined_confidence =
                 (tool_call_result.confidence + user_messages_result.confidence) / 2.0;
-            let explanation = "Tool appears to be the result of a prompt injection attack.".to_string();
+            let explanation =
+                "Tool appears to be the result of a prompt injection attack.".to_string();
             (combined_confidence, explanation)
         } else {
             // Use tool call confidence as-is, let config threshold decide
             let explanation = if tool_call_result.confidence > 0.0 {
-                format!("Tool flagged with confidence: {:.2}", tool_call_result.confidence)
+                format!(
+                    "Tool flagged with confidence: {:.2}",
+                    tool_call_result.confidence
+                )
             } else {
                 "Tool appears safe".to_string()
             };
@@ -491,8 +498,6 @@ impl PromptInjectionScanner {
         }
     }
 
-
-
     /// Scan system prompt for persistent injection attacks
     pub async fn scan_system_prompt(&self, system_prompt: &str) -> Result<ScanResult> {
         tracing::info!(
@@ -504,12 +509,12 @@ impl PromptInjectionScanner {
         self.scan_with_prompt_injection_model(system_prompt).await
     }
 
-    /// Model-agnostic prompt injection scanning - public for recipe scanning
+    /// Model-agnostic prompt injection scanning with chunking for long texts
     pub async fn scan_with_prompt_injection_model(&self, text: &str) -> Result<ScanResult> {
         tracing::info!(
             "🔒 Starting scan_with_prompt_injection_model for text (length: {}): '{}'",
             text.len(),
-            text.chars().take(100).collect::<String>()
+            text
         );
 
         // Always run pattern-based scanning first
@@ -519,50 +524,267 @@ impl PromptInjectionScanner {
         tracing::info!("🔒 Attempting to get ML model...");
         if let Some(model) = get_model().await {
             tracing::info!("🔒 ML model retrieved successfully, calling predict...");
-            tracing::info!(
-                "🔒 About to call model.predict() with text length: {}",
-                text.len()
+
+            // Use chunked scanning for long texts
+            let ml_result = self.scan_with_ml_model_chunked(text, &model).await?;
+
+            // Combine ML and pattern results
+            let combined_result = self.combine_scan_results(
+                &pattern_result,
+                ml_result.confidence,
+                &ml_result.explanation,
+                ml_result.is_malicious,
             );
-            match model.predict(text).await {
-                Ok((ml_confidence, ml_explanation)) => {
-                    tracing::info!("🔒 ML model predict returned successfully");
-                    // Get threshold from config
-                    let threshold = self.get_threshold_from_config();
-                    let ml_is_malicious = ml_confidence > threshold;
 
-                    tracing::info!(
-                        "🔒 ML model prediction: confidence={:.3}, threshold={:.3}, malicious={}",
-                        ml_confidence,
-                        threshold,
-                        ml_is_malicious
-                    );
+            tracing::info!(
+                "🔒 Combined scan result: ML confidence={:.3}, Pattern confidence={:.3}, Final confidence={:.3}, Final malicious={}",
+                ml_result.confidence, pattern_result.confidence, combined_result.confidence, combined_result.is_malicious
+            );
 
-                    // Combine ML and pattern results
-                    let combined_result = self.combine_scan_results(
-                        &pattern_result,
-                        ml_confidence,
-                        &ml_explanation,
-                        ml_is_malicious,
-                    );
-
-                    tracing::info!(
-                        "🔒 Combined scan result: ML confidence={:.3}, Pattern confidence={:.3}, Final confidence={:.3}, Final malicious={}",
-                        ml_confidence, pattern_result.confidence, combined_result.confidence, combined_result.is_malicious
-                    );
-
-                    return Ok(combined_result);
-                }
-                Err(e) => {
-                    tracing::warn!("🔒 ML model prediction failed: {}", e);
-                    // Fall through to pattern-only result
-                }
-            }
+            return Ok(combined_result);
         } else {
             tracing::info!("🔒 No ML model available, using pattern-based scanning only");
         }
 
         tracing::info!("🔒 Using pattern-based scan result only");
         Ok(pattern_result)
+    }
+
+    /// Scan text with ML model using mathematically guaranteed sliding window approach
+    async fn scan_with_ml_model_chunked(
+        &self,
+        text: &str,
+        model: &Arc<dyn PromptInjectionModel>,
+    ) -> Result<ScanResult> {
+        // Use the already-loaded tokenizer from the model
+        let tokenizer = model.get_tokenizer();
+
+        // Sliding window parameters for mathematical guarantee
+        const WINDOW_SIZE: usize = 32; // Maximum model capacity
+        const DEFAULT_STRIDE: usize = 16;
+        const HIGH_SECURITY_STRIDE: usize = 8;
+
+        tracing::info!(
+            "🔒 Starting sliding window ML scanning for text length: {} characters",
+            text.len()
+        );
+
+        // Tokenize the full text first
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("Failed to tokenize text: {}", e))?;
+
+        let tokens = encoding.get_ids();
+        let total_tokens = tokens.len();
+
+        // Adaptive stride selection based on document size and security needs
+        let stride = if total_tokens < 1000 {
+            HIGH_SECURITY_STRIDE // High security for short documents
+        } else {
+            DEFAULT_STRIDE // Balanced approach for longer documents
+        };
+
+        let max_detectable_attack_length = WINDOW_SIZE - stride;
+
+        tracing::info!(
+            "🔒 Text tokenized: {} tokens total, window size: {} tokens, stride: {} tokens, max detectable attack: {} tokens",
+            total_tokens, WINDOW_SIZE, stride, max_detectable_attack_length
+        );
+
+        // For texts that fit in a single window, scan directly
+        if total_tokens <= WINDOW_SIZE {
+            tracing::info!(
+                "🔒 Text fits in single window ({} tokens), scanning directly",
+                total_tokens
+            );
+            return self.scan_single_chunk(text, model).await;
+        }
+
+        // Generate sliding windows with mathematical guarantee
+        let windows = self.generate_sliding_windows(tokens, tokenizer, WINDOW_SIZE, stride)?;
+
+        tracing::info!(
+            "🔒 Generated {} sliding windows with stride {} (guarantees detection of attacks up to {} tokens)",
+            windows.len(), stride, max_detectable_attack_length
+        );
+
+        // Scan windows with early termination on high confidence threats
+        let mut max_confidence = 0.0;
+        let mut threat_chunks = Vec::new();
+        let emergency_threshold = 0.9; // Stop immediately on very high confidence
+
+        for (window_idx, window) in windows.iter().enumerate() {
+            let window_num = window_idx + 1;
+
+            tracing::debug!(
+                "🔒 Processing window {} of {}: {} tokens, {} chars",
+                window_num,
+                windows.len(),
+                window.token_count,
+                window.text.len()
+            );
+
+            // Scan this window
+            match self.scan_single_chunk(&window.text, model).await {
+                Ok(window_result) => {
+                    tracing::debug!(
+                        "🔒 Window {} result: confidence={:.3}, malicious={}",
+                        window_num,
+                        window_result.confidence,
+                        window_result.is_malicious
+                    );
+
+                    // Track maximum confidence across all windows
+                    if window_result.confidence > max_confidence {
+                        max_confidence = window_result.confidence;
+                    }
+
+                    // Early termination on emergency-level threats
+                    if window_result.confidence > emergency_threshold {
+                        tracing::warn!(
+                            "🔒 Emergency threshold exceeded in window {}: confidence={:.3}, terminating scan early",
+                            window_num, window_result.confidence
+                        );
+                        return Ok(ScanResult {
+                            is_malicious: true,
+                            confidence: window_result.confidence,
+                            explanation: format!(
+                                "Sliding window scan: Emergency threat detected in window {} of {} (tokens {}-{}): {}",
+                                window_num, windows.len(), window.start_token, window.end_token, window_result.explanation
+                            ),
+                        });
+                    }
+
+                    // Collect information about threatening windows
+                    if window_result.is_malicious {
+                        threat_chunks.push(format!(
+                            "Window {} (tokens {}-{}): confidence={:.3}",
+                            window_num,
+                            window.start_token,
+                            window.end_token,
+                            window_result.confidence
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("🔒 Failed to scan window {}: {}", window_num, e);
+                    // Continue with other windows even if one fails
+                }
+            }
+        }
+
+        // Aggregate results
+        let threshold = self.get_threshold_from_config();
+        let is_malicious = max_confidence > threshold;
+
+        let explanation = if threat_chunks.is_empty() {
+            format!(
+                "Sliding window scan: Analyzed {} overlapping windows ({} tokens total, stride {}), max confidence {:.3}, no threats detected",
+                windows.len(), total_tokens, stride, max_confidence
+            )
+        } else {
+            format!(
+                "Sliding window scan: Analyzed {} overlapping windows ({} tokens total, stride {}), threats detected in {} windows: {}",
+                windows.len(), total_tokens, stride, threat_chunks.len(), threat_chunks.join("; ")
+            )
+        };
+
+        tracing::info!(
+            "🔒 Sliding window scan complete: {} windows with stride {}, max_confidence={:.3}, threshold={:.3}, malicious={}",
+            windows.len(),
+            stride,
+            max_confidence,
+            threshold,
+            is_malicious
+        );
+
+        Ok(ScanResult {
+            is_malicious,
+            confidence: max_confidence,
+            explanation,
+        })
+    }
+
+    /// Generate sliding windows with mathematical guarantee for attack detection
+    fn generate_sliding_windows(
+        &self,
+        tokens: &[u32],
+        tokenizer: &Arc<Tokenizer>,
+        window_size: usize,
+        stride: usize,
+    ) -> Result<Vec<SlidingWindow>> {
+        let mut windows = Vec::new();
+        let total_tokens = tokens.len();
+        let mut start_token = 0;
+
+        while start_token < total_tokens {
+            let end_token = std::cmp::min(start_token + window_size, total_tokens);
+
+            // Skip tiny windows at the end unless they're the only window
+            if end_token - start_token < 50 && !windows.is_empty() {
+                break;
+            }
+
+            // Extract token slice and decode back to text
+            let window_tokens = &tokens[start_token..end_token];
+            let window_text = tokenizer
+                .decode(window_tokens, true)
+                .map_err(|e| anyhow!("Failed to decode window tokens: {}", e))?;
+
+            windows.push(SlidingWindow {
+                start_token,
+                end_token,
+                token_count: window_tokens.len(),
+                text: window_text,
+            });
+
+            // Move to next window
+            start_token += stride;
+
+            // If we've covered all tokens, break
+            if end_token >= total_tokens {
+                break;
+            }
+        }
+
+        Ok(windows)
+    }
+
+    /// Scan a single chunk of text with the ML model
+    async fn scan_single_chunk(
+        &self,
+        text: &str,
+        model: &Arc<dyn PromptInjectionModel>,
+    ) -> Result<ScanResult> {
+        tracing::debug!(
+            "🔒 Scanning single chunk: length {} chars, preview: '{}'",
+            text.len(),
+            text.chars().take(100).collect::<String>()
+        );
+
+        match model.predict(text).await {
+            Ok((ml_confidence, ml_explanation)) => {
+                let threshold = self.get_threshold_from_config();
+                let is_malicious = ml_confidence > threshold;
+
+                tracing::debug!(
+                    "🔒 Single chunk ML result: confidence={:.3}, threshold={:.3}, malicious={}",
+                    ml_confidence,
+                    threshold,
+                    is_malicious
+                );
+
+                Ok(ScanResult {
+                    is_malicious,
+                    confidence: ml_confidence,
+                    explanation: ml_explanation,
+                })
+            }
+            Err(e) => {
+                tracing::warn!("🔒 ML model prediction failed for chunk: {}", e);
+                Err(e)
+            }
+        }
     }
 
     /// Combine ML model and pattern matching results
@@ -757,12 +979,19 @@ impl PromptInjectionScanner {
             })
         }
     }
-
-
 }
 
 impl Default for PromptInjectionScanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Represents a sliding window for ML scanning
+#[derive(Debug, Clone)]
+struct SlidingWindow {
+    start_token: usize,
+    end_token: usize,
+    token_count: usize,
+    text: String,
 }

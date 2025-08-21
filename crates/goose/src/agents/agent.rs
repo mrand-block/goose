@@ -1081,29 +1081,6 @@ impl Agent {
                                         );
                                     }
                                 } else {
-                                    // Check if we need to show model download status before security scanning
-                                    if let Some(download_message) = self.security_manager.check_model_download_status().await {
-                                        yield AgentEvent::Message(Message::assistant().with_text(download_message));
-                                    }
-
-                                    // SECURITY FIX: Scan tools for prompt injection BEFORE permission checking
-                                    // This ensures security results can override auto-mode approvals
-                                    let initial_permission_result = PermissionCheckResult {
-                                        approved: remaining_requests.clone(),
-                                        needs_approval: vec![],
-                                        denied: vec![],
-                                    };
-
-                                    println!("🔍 DEBUG: About to call security manager with {} total tools", remaining_requests.len());
-                                    let security_results = self.security_manager
-                                        .filter_malicious_tool_calls(messages.messages(), &initial_permission_result, Some(&system_prompt))
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!("Security scanning failed: {}", e);
-                                            vec![]
-                                        });
-
-                                    // Now run permission checking with security context
                                     let mut permission_manager = PermissionManager::default();
                                     let (permission_check_result, enable_extension_request_ids) =
                                         check_tool_permissions(
@@ -1115,45 +1092,26 @@ impl Agent {
                                             self.provider().await?,
                                         ).await;
 
-                                    // Apply security results to override permission decisions
-                                    let final_permission_result = self.apply_security_results_to_permissions(
-                                        permission_check_result,
-                                        &security_results
-                                    ).await;
-
-                                    println!("🔍 DEBUG: After security integration - {} approved, {} need approval, {} denied",
-                                        final_permission_result.approved.len(),
-                                        final_permission_result.needs_approval.len(),
-                                        final_permission_result.denied.len());
+                                    println!("🔍 DEBUG: After permission check - {} approved, {} need approval, {} denied",
+                                        permission_check_result.approved.len(),
+                                        permission_check_result.needs_approval.len(),
+                                        permission_check_result.denied.len());
 
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
-                                        &final_permission_result,
+                                        &permission_check_result,
                                         message_tool_response.clone(),
                                         cancel_token.clone()
                                     ).await?;
 
                                     let tool_futures_arc = Arc::new(Mutex::new(tool_futures));
 
-                                    // Process tools requiring approval (including security-flagged tools)
-                                    // Create a mapping of security results for tools that need approval
-                                    let mut security_results_for_approval: Vec<Option<&crate::security::SecurityResult>> = Vec::new();
-                                    for _approval_request in &final_permission_result.needs_approval {
-                                        // Find the corresponding security result for this tool request
-                                        let security_result = security_results.iter().find(|result| {
-                                            // Match by checking if this tool was flagged as malicious
-                                            // This is a simplified matching - ideally we'd have better tool request tracking
-                                            result.is_malicious
-                                        });
-                                        security_results_for_approval.push(security_result);
-                                    }
-
-                                    let mut tool_approval_stream = self.handle_approval_tool_requests_with_security(
-                                        &final_permission_result.needs_approval,
+                                    // Process tools requiring approval
+                                    let mut tool_approval_stream = self.handle_approval_tool_requests(
+                                        &permission_check_result.needs_approval,
                                         tool_futures_arc.clone(),
                                         &mut permission_manager,
                                         message_tool_response.clone(),
                                         cancel_token.clone(),
-                                        Some(&security_results_for_approval),
                                     );
 
                                     while let Some(msg) = tool_approval_stream.try_next().await? {
@@ -1186,9 +1144,145 @@ impl Agent {
                                                 {
                                                     all_install_successful = false;
                                                 }
+
+                                                // SECURITY: Scan tool response content for prompt injection
+                                                let final_output = match &output {
+                                                    Ok(_tool_result) => {
+                                                        if let Some(response_text) = extract_tool_response_text(&output) {
+                                                            match self.security_manager.scan_response_content(&response_text, messages.messages()).await {
+                                                                Ok(security_result) if security_result.is_malicious => {
+                                                                    tracing::warn!(
+                                                                        tool_request_id = %request_id,
+                                                                        confidence = security_result.confidence,
+                                                                        explanation = %security_result.explanation,
+                                                                        finding_id = %security_result.finding_id,
+                                                                        "🔒 Malicious content detected in tool response"
+                                                                    );
+
+                                                                    // Handle malicious response with user interaction
+                                                                    match self.handle_malicious_response(
+                                                                        request_id.clone(),
+                                                                        output.clone(),
+                                                                        security_result
+                                                                    ).await {
+                                                                        Ok(Some(filtered_result)) => filtered_result,
+                                                                        Ok(None) => {
+                                                                            // Response was blocked entirely
+                                                                            Err(rmcp::model::ErrorData::new(
+                                                                                rmcp::model::ErrorCode::INTERNAL_ERROR,
+                                                                                "Response blocked for security reasons".to_string(),
+                                                                                None
+                                                                            ))
+                                                                        }
+                                                                        Err(e) if e.to_string().starts_with("SECURITY_USER_CONFIRMATION_NEEDED:") => {
+                                                                            // Extract the confirmation data from the error message
+                                                                            let error_string = e.to_string();
+                                                                            let json_str = error_string.strip_prefix("SECURITY_USER_CONFIRMATION_NEEDED:").unwrap();
+                                                                            if let Ok(confirmation_data) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                                                                // Extract the warning message from the confirmation data
+                                                                                if let Some(_warning_msg_value) = confirmation_data.get("warning_message") {
+                                                                                    // Reconstruct the Message from the JSON data
+                                                                                    // For now, create a simple security warning message
+                                                                                    let security_info = confirmation_data.get("security_result").unwrap();
+                                                                                    let finding_id = security_info.get("finding_id").unwrap().as_str().unwrap();
+                                                                                    let confidence = security_info.get("confidence").unwrap().as_f64().unwrap();
+                                                                                    let explanation = security_info.get("explanation").unwrap().as_str().unwrap();
+
+                                                                                    let warning_message = Message::user().with_tool_confirmation_request(
+                                                                                        request_id.clone(),
+                                                                                        "security_response_filter".to_string(),
+                                                                                        serde_json::Value::Null,
+                                                                                        Some(format!(
+                                                                                            "🚨 SECURITY WARNING: Tool response contains potentially malicious content.\n\
+                                                                                            Finding ID: {}\n\
+                                                                                            Confidence: {:.1}%\n\
+                                                                                            Reason: {}\n\n\
+                                                                                            The tool has already executed, but its response contains suspicious content.\n\
+                                                                                            Allow this response to be processed? (y/n):",
+                                                                                            finding_id,
+                                                                                            confidence * 100.0,
+                                                                                            explanation
+                                                                                        )),
+                                                                                    );
+
+                                                                                    // Yield the security warning to the user
+                                                                                    yield AgentEvent::Message(warning_message);
+
+                                                                                    // Wait for user confirmation
+                                                                                    let mut rx = self.confirmation_rx.lock().await;
+                                                                                    let user_decision = loop {
+                                                                                        if let Some((req_id, confirmation)) = rx.recv().await {
+                                                                                            if req_id == request_id {
+                                                                                                match confirmation.permission {
+                                                                                                    crate::permission::Permission::AllowOnce | crate::permission::Permission::AlwaysAllow => {
+                                                                                                        tracing::warn!(
+                                                                                                            tool_request_id = %request_id,
+                                                                                                            permission = ?confirmation.permission,
+                                                                                                            security_confidence = %format!("{:.1}%", confidence * 100.0),
+                                                                                                            security_reason = %explanation,
+                                                                                                            finding_id = %finding_id,
+                                                                                                            "🔒 USER APPROVED security-flagged tool response despite warning"
+                                                                                                        );
+                                                                                                        // User approved - use original result
+                                                                                                        break output.clone();
+                                                                                                    }
+                                                                                                    _ => {
+                                                                                                        tracing::info!(
+                                                                                                            tool_request_id = %request_id,
+                                                                                                            permission = ?confirmation.permission,
+                                                                                                            security_confidence = %format!("{:.1}%", confidence * 100.0),
+                                                                                                            security_reason = %explanation,
+                                                                                                            finding_id = %finding_id,
+                                                                                                            "🔒 USER DENIED security-flagged tool response"
+                                                                                                        );
+                                                                                                        // User denied - block the response
+                                                                                                        break Err(rmcp::model::ErrorData::new(
+                                                                                                            rmcp::model::ErrorCode::INTERNAL_ERROR,
+                                                                                                            format!("Response blocked by user due to security concerns: {}", explanation),
+                                                                                                            None
+                                                                                                        ));
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    };
+                                                                                    user_decision
+                                                                                } else {
+                                                                                    tracing::error!("Failed to extract warning message from security confirmation data");
+                                                                                    output.clone() // Fail open
+                                                                                }
+                                                                            } else {
+                                                                                tracing::error!("Failed to parse security confirmation data");
+                                                                                output.clone() // Fail open
+                                                                            }
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::warn!("Failed to handle malicious response: {}", e);
+                                                                            output.clone() // Fail open
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(_) => {
+                                                                    // Response is safe, use original
+                                                                    output.clone()
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!("Security scanning of tool response failed: {}", e);
+                                                                    // On scan failure, allow response through (fail open)
+                                                                    output.clone()
+                                                                }
+                                                            }
+                                                        } else {
+                                                            // No text content to scan, use original result
+                                                            output.clone()
+                                                        }
+                                                    }
+                                                    Err(_) => output.clone(), // Error responses pass through
+                                                };
+
                                                 let mut response = message_tool_response.lock().await;
                                                 *response =
-                                                    response.clone().with_tool_response(request_id, output);
+                                                    response.clone().with_tool_response(request_id, final_output);
                                             }
                                             ToolStreamItem::Message(msg) => {
                                                 yield AgentEvent::McpNotification((
@@ -1370,6 +1464,86 @@ impl Agent {
         }
 
         permission_result
+    }
+
+    /// Handle malicious tool response with user interaction
+    async fn handle_malicious_response(
+        &self,
+        tool_request_id: String,
+        original_result: mcp_core::ToolResult<Vec<rmcp::model::Content>>,
+        security_result: crate::security::SecurityResult,
+    ) -> anyhow::Result<Option<mcp_core::ToolResult<Vec<rmcp::model::Content>>>> {
+        if security_result.should_ask_user {
+            // Create security warning message and send it to user
+            let warning_message = Message::user().with_tool_confirmation_request(
+                tool_request_id.clone(),
+                "security_response_filter".to_string(),
+                serde_json::Value::Null,
+                Some(format!(
+                    "🚨 SECURITY WARNING: Tool response contains potentially malicious content.\n\
+                    Finding ID: {}\n\
+                    Confidence: {:.1}%\n\
+                    Reason: {}\n\n\
+                    The tool has already executed, but its response contains suspicious content.\n\
+                    Allow this response to be processed? (y/n):",
+                    security_result.finding_id,
+                    security_result.confidence * 100.0,
+                    security_result.explanation
+                )),
+            );
+
+            // This warning message needs to be yielded to the user - we'll return it as a special case
+            // The calling code needs to handle this by yielding the message and waiting for confirmation
+            tracing::warn!(
+                tool_request_id = %tool_request_id,
+                confidence = security_result.confidence,
+                explanation = %security_result.explanation,
+                finding_id = %security_result.finding_id,
+                "🔒 Security warning requires user confirmation for tool response"
+            );
+
+            // Return a special marker indicating user confirmation is needed
+            // The calling code will handle the actual user interaction
+            return Err(anyhow::anyhow!(
+                "SECURITY_USER_CONFIRMATION_NEEDED:{}",
+                serde_json::to_string(&serde_json::json!({
+                    "warning_message": warning_message,
+                    "original_result": match &original_result {
+                        Ok(contents) => serde_json::json!({
+                            "type": "success",
+                            "content_count": contents.len()
+                        }),
+                        Err(error) => serde_json::json!({
+                            "type": "error",
+                            "message": error.message
+                        })
+                    },
+                    "security_result": {
+                        "finding_id": security_result.finding_id,
+                        "confidence": security_result.confidence,
+                        "explanation": security_result.explanation
+                    }
+                }))?
+            ));
+        } else {
+            // Auto-block without user interaction for high-confidence threats
+            tracing::warn!(
+                tool_request_id = %tool_request_id,
+                confidence = security_result.confidence,
+                explanation = %security_result.explanation,
+                finding_id = %security_result.finding_id,
+                "🔒 Tool response automatically blocked for security reasons"
+            );
+
+            Ok(Some(Err(rmcp::model::ErrorData::new(
+                rmcp::model::ErrorCode::INTERNAL_ERROR,
+                format!(
+                    "Response automatically blocked for security reasons: {}",
+                    security_result.explanation
+                ),
+                None,
+            ))))
+        }
     }
 
     /// Extend the system prompt with one line of additional instruction
@@ -1608,6 +1782,30 @@ impl Agent {
             .expect("valid recipe");
 
         Ok(recipe)
+    }
+}
+
+/// Extract text content from a tool result for security scanning
+fn extract_tool_response_text(
+    tool_result: &mcp_core::ToolResult<Vec<rmcp::model::Content>>,
+) -> Option<String> {
+    match tool_result {
+        Ok(contents) => {
+            // Extract text from content
+            let text_contents: Vec<String> = contents
+                .iter()
+                .filter_map(|content| content.as_text().map(|t| t.text.to_string()))
+                .collect();
+            if !text_contents.is_empty() {
+                Some(text_contents.join("\n"))
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            // Could also scan error messages for malicious content
+            Some(error.message.to_string())
+        }
     }
 }
 
