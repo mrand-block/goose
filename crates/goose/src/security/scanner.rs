@@ -62,6 +62,46 @@ impl OnnxPromptInjectionModel {
             model_name,
         })
     }
+
+    /// Log ONNX prediction input to file for analysis
+    async fn log_onnx_prediction_to_file(&self, text: &str) {
+        use chrono::Utc;
+        use std::io::Write;
+
+        let log_path = "/tmp/ml-log.txt";
+
+        // Create log entry with timestamp and full text
+        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
+        let separator = "=".repeat(80);
+        let log_entry = format!(
+            "\n{}\n[{}] ONNX_PREDICT_INPUT - Length: {} chars\n{}\n{}\n{}\n",
+            separator,
+            timestamp,
+            text.len(),
+            separator,
+            text,
+            separator
+        );
+
+        // Append to log file (create if doesn't exist)
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            if let Err(e) = file.write_all(log_entry.as_bytes()) {
+                tracing::warn!(
+                    "🔒 Failed to write ONNX input to security log file {}: {}",
+                    log_path,
+                    e
+                );
+            } else {
+                tracing::debug!("🔒 Logged ONNX input to {}", log_path);
+            }
+        } else {
+            tracing::warn!("🔒 Failed to open security log file {}", log_path);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -72,6 +112,9 @@ impl PromptInjectionModel for OnnxPromptInjectionModel {
             "🔒 ONNX predict() received text: '{}'",
             text.chars().take(200).collect::<String>()
         );
+
+        // Log full text to file for analysis
+        self.log_onnx_prediction_to_file(text).await;
 
         // Tokenize the input text
         tracing::debug!("🔒 Tokenizing input text...");
@@ -525,8 +568,8 @@ impl PromptInjectionScanner {
         if let Some(model) = get_model().await {
             tracing::info!("🔒 ML model retrieved successfully, calling predict...");
 
-            // Use chunked scanning for long texts
-            let ml_result = self.scan_with_ml_model_chunked(text, &model).await?;
+            // Use single chunk scanning for general text (not tool responses)
+            let ml_result = self.scan_single_chunk(text, &model).await?;
 
             // Combine ML and pattern results
             let combined_result = self.combine_scan_results(
@@ -550,6 +593,473 @@ impl PromptInjectionScanner {
         Ok(pattern_result)
     }
 
+    /// Scan tool response content with normalization and 512-token chunking
+    pub async fn scan_tool_response_content(&self, text: &str) -> Result<ScanResult> {
+        tracing::info!(
+            "🔒 Starting tool response content scan for text (length: {} chars): '{}'",
+            text.len(),
+            text.chars().take(200).collect::<String>()
+        );
+
+        // Log full content to file for analysis
+        self.log_security_scan_to_file("ORIGINAL", text).await;
+
+        // Step 1: Normalize the text
+        let normalized_text = self.normalize_text(text);
+
+        tracing::info!(
+            "🔒 Text normalization complete: original {} chars → normalized {} chars, preview: '{}'",
+            text.len(),
+            normalized_text.len(),
+            normalized_text.chars().take(200).collect::<String>()
+        );
+
+        // Log normalized content to file for analysis
+        self.log_security_scan_to_file("NORMALIZED", &normalized_text)
+            .await;
+
+        // Step 2: Check if normalized text is empty
+        if normalized_text.trim().is_empty() {
+            tracing::info!("🔒 Normalized text is empty, skipping security scan");
+            return Ok(ScanResult {
+                is_malicious: false,
+                confidence: 0.0,
+                explanation: "Skipped scan: normalized text is empty".to_string(),
+            });
+        }
+
+        // Step 3: Always run pattern-based scanning first on original text
+        let pattern_result = self.scan_with_patterns(text).await?;
+
+        // Step 4: Try to get the ML model for additional scanning
+        tracing::info!("🔒 Attempting to get ML model for normalized text scanning...");
+        if let Some(model) = get_model().await {
+            tracing::info!("🔒 ML model retrieved successfully, starting 512-token chunking...");
+
+            // Use 512-token chunking on normalized text
+            let ml_result = self
+                .scan_with_normalization_and_chunking(&normalized_text, &model)
+                .await?;
+
+            // Combine ML and pattern results
+            let combined_result = self.combine_scan_results(
+                &pattern_result,
+                ml_result.confidence,
+                &ml_result.explanation,
+                ml_result.is_malicious,
+            );
+
+            tracing::info!(
+                "🔒 Tool response scan complete: ML confidence={:.3}, Pattern confidence={:.3}, Final confidence={:.3}, Final malicious={}",
+                ml_result.confidence, pattern_result.confidence, combined_result.confidence, combined_result.is_malicious
+            );
+
+            return Ok(combined_result);
+        } else {
+            tracing::info!("🔒 No ML model available, using pattern-based scanning only");
+        }
+
+        tracing::info!("🔒 Using pattern-based scan result only for tool response");
+        Ok(pattern_result)
+    }
+
+    /// Level 11: Optimized smart filtering - best of all approaches
+    /// Uses statistical analysis to intelligently determine content type and apply appropriate deduplication
+    fn normalize_text(&self, text: &str) -> String {
+        use regex::Regex;
+
+        let mut normalized = text.to_string();
+
+        // Step 1: Apply Level 7 normalization first (filesystem cleanup)
+        // Remove permission strings like "-rwxr-xr-x"
+        let perm_regex = Regex::new(r"-[rwx-]{9}").unwrap();
+        normalized = perm_regex.replace_all(&normalized, "").to_string();
+
+        // Remove directory permissions like "drwxr-xr-x"
+        let dir_perm_regex = Regex::new(r"drwx[rwx-]*").unwrap();
+        normalized = dir_perm_regex.replace_all(&normalized, "").to_string();
+
+        // Remove file sizes like "1024", "2K", "5MB"
+        let size_regex = Regex::new(r"\b\d+[BKMG]?\b").unwrap();
+        normalized = size_regex.replace_all(&normalized, "").to_string();
+
+        // Remove timestamps like "Aug 21 14:30"
+        let timestamp_regex = Regex::new(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}\b").unwrap();
+        normalized = timestamp_regex.replace_all(&normalized, "").to_string();
+
+        // Remove dates like "Aug 21 2024"
+        let date_regex = Regex::new(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\b").unwrap();
+        normalized = date_regex.replace_all(&normalized, "").to_string();
+
+        // Remove "total 104" patterns
+        let total_regex = Regex::new(r"\btotal\s+\d+\b").unwrap();
+        normalized = total_regex.replace_all(&normalized, "").to_string();
+
+        // Remove special chars + numbers (keep only letters and spaces)
+        let letters_only_regex = Regex::new(r"[^a-zA-Z\s]").unwrap();
+        normalized = letters_only_regex.replace_all(&normalized, "").to_string();
+
+        // Step 2: Optimized context-aware pattern removal
+        normalized = self.optimized_repetitive_pattern_removal(&normalized);
+
+        // Step 3: Collapse all whitespace
+        let whitespace_regex = Regex::new(r"\s+").unwrap();
+        normalized = whitespace_regex.replace_all(&normalized, "").to_string();
+
+        normalized
+    }
+
+    /// Optimized context-aware repetitive pattern removal using statistical and linguistic
+    /// patterns instead of hardcoded word lists. This approach is agnostic to content domain.
+    fn optimized_repetitive_pattern_removal(&self, text: &str) -> String {
+        use regex::Regex;
+        use std::collections::{HashMap, HashSet};
+
+        // Split into words for analysis
+        let word_regex = Regex::new(r"\w+").unwrap();
+        let words: Vec<&str> = word_regex.find_iter(text).map(|m| m.as_str()).collect();
+
+        if words.len() < 3 {
+            return text.to_string();
+        }
+
+        // Analyze word patterns
+        let mut word_counts = HashMap::new();
+        for word in &words {
+            *word_counts.entry(*word).or_insert(0) += 1;
+        }
+
+        let total_words = words.len() as f64;
+        let unique_words = word_counts.len() as f64;
+
+        // Statistical indicators for content type detection
+        let short_words = words.iter().filter(|w| w.len() <= 4).count() as f64;
+        let long_words = words.iter().filter(|w| w.len() >= 8).count() as f64;
+        let very_long_words = words.iter().filter(|w| w.len() >= 12).count() as f64;
+
+        let short_word_ratio = if total_words > 0.0 {
+            short_words / total_words
+        } else {
+            0.0
+        };
+        let long_word_ratio = if total_words > 0.0 {
+            long_words / total_words
+        } else {
+            0.0
+        };
+        let very_long_word_ratio = if total_words > 0.0 {
+            very_long_words / total_words
+        } else {
+            0.0
+        };
+
+        // Repetition analysis
+        let _highly_repeated_words =
+            word_counts.values().filter(|&&count| count >= 5).count() as f64;
+        let _moderately_repeated_words =
+            word_counts.values().filter(|&&count| count >= 3).count() as f64;
+
+        // Diversity metrics
+        let lexical_diversity = if total_words > 0.0 {
+            unique_words / total_words
+        } else {
+            0.0
+        };
+        let repetition_density = if total_words > 0.0 {
+            (total_words - unique_words) / total_words
+        } else {
+            0.0
+        };
+
+        // Content type classification based on statistical patterns
+        // High repetition + low diversity + many short words = likely structured/filesystem data
+        let structured_data_score = (repetition_density * 2.0)
+            + (1.0 - lexical_diversity)
+            + short_word_ratio
+            + (very_long_word_ratio * 0.5);
+
+        // High diversity + balanced word lengths = likely natural language
+        let natural_language_score = lexical_diversity
+            + (1.0 - repetition_density)
+            + (1.0 - short_word_ratio)
+            + (long_word_ratio * 0.5);
+
+        tracing::debug!(
+            "🔒 Content analysis: structured_score={:.3}, natural_score={:.3}, lexical_diversity={:.3}, repetition_density={:.3}",
+            structured_data_score, natural_language_score, lexical_diversity, repetition_density
+        );
+
+        // Determine content type and apply appropriate strategy
+        let (repetitive_threshold, keep_occurrences) =
+            if structured_data_score > natural_language_score && structured_data_score > 1.5 {
+                // Structured/filesystem-like content - aggressive deduplication
+                tracing::debug!(
+                    "🔒 Detected structured/filesystem content - applying aggressive deduplication"
+                );
+                (2, 1)
+            } else if natural_language_score > structured_data_score && natural_language_score > 1.2
+            {
+                // Natural language content - conservative deduplication
+                tracing::debug!(
+                    "🔒 Detected natural language content - applying conservative deduplication"
+                );
+                (6, 3)
+            } else {
+                // Mixed or uncertain content - balanced approach
+                tracing::debug!(
+                    "🔒 Detected mixed/uncertain content - applying balanced deduplication"
+                );
+                (4, 2)
+            };
+
+        // Apply deduplication based on determined strategy
+        let repetitive_words: HashSet<&str> = word_counts
+            .iter()
+            .filter(|(&word, &count)| count >= repetitive_threshold && word.len() >= 3)
+            .map(|(&word, _)| word)
+            .collect();
+
+        tracing::debug!(
+            "🔒 Found {} repetitive words with threshold {}, keeping {} occurrences each",
+            repetitive_words.len(),
+            repetitive_threshold,
+            keep_occurrences
+        );
+
+        let mut filtered_words = Vec::new();
+        let mut word_usage = HashMap::new();
+
+        for word in &words {
+            if repetitive_words.contains(word) {
+                let usage = word_usage.entry(*word).or_insert(0);
+                *usage += 1;
+                if *usage <= keep_occurrences {
+                    filtered_words.push(*word);
+                }
+                // Skip subsequent occurrences
+            } else {
+                filtered_words.push(*word);
+            }
+        }
+
+        let mut result = filtered_words.join(" ");
+
+        tracing::debug!(
+            "🔒 After word deduplication: {} words -> {} words",
+            words.len(),
+            filtered_words.len()
+        );
+
+        // Character-level pattern removal (applies to all content types)
+        let original_len = result.len();
+        for pattern_len in 3..std::cmp::min(12, result.len() / 3) {
+            let pattern = format!(r"(\w{{{}}})(\1){{2,}}", pattern_len);
+            if let Ok(pattern_regex) = Regex::new(&pattern) {
+                result = pattern_regex.replace_all(&result, "$1").to_string();
+            }
+        }
+
+        tracing::debug!(
+            "🔒 After character-level deduplication: {} chars -> {} chars",
+            original_len,
+            result.len()
+        );
+
+        result
+    }
+
+    /// Log security scan data to file for analysis
+    async fn log_security_scan_to_file(&self, stage: &str, content: &str) {
+        use chrono::Utc;
+        use std::io::Write;
+
+        let log_path = "/tmp/ml-log.txt";
+
+        // Create log entry with timestamp and stage
+        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
+        let separator = "=".repeat(80);
+        let log_entry = format!(
+            "\n{}\n[{}] {} - Length: {} chars\n{}\n{}\n{}\n",
+            separator,
+            timestamp,
+            stage,
+            content.len(),
+            separator,
+            content,
+            separator
+        );
+
+        // Append to log file (create if doesn't exist)
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            if let Err(e) = file.write_all(log_entry.as_bytes()) {
+                tracing::warn!(
+                    "🔒 Failed to write to security log file {}: {}",
+                    log_path,
+                    e
+                );
+            } else {
+                tracing::debug!("🔒 Logged {} content to {}", stage, log_path);
+            }
+        } else {
+            tracing::warn!("🔒 Failed to open security log file {}", log_path);
+        }
+    }
+
+    /// Scan normalized text with 512-token chunking strategy
+    async fn scan_with_normalization_and_chunking(
+        &self,
+        normalized_text: &str,
+        model: &Arc<dyn PromptInjectionModel>,
+    ) -> Result<ScanResult> {
+        const MAX_TOKENS_PER_CHUNK: usize = 512;
+
+        tracing::info!(
+            "🔒 Starting 512-token chunking scan for normalized text (length: {} chars)",
+            normalized_text.len()
+        );
+
+        // Use the model's tokenizer
+        let tokenizer = model.get_tokenizer();
+
+        // Tokenize the normalized text
+        let encoding = tokenizer
+            .encode(normalized_text, false)
+            .map_err(|e| anyhow!("Failed to tokenize normalized text: {}", e))?;
+
+        let tokens = encoding.get_ids();
+        let total_tokens = tokens.len();
+
+        tracing::info!(
+            "🔒 Normalized text tokenized: {} total tokens, max {} tokens per chunk",
+            total_tokens,
+            MAX_TOKENS_PER_CHUNK
+        );
+
+        // If text fits in single chunk, scan directly
+        if total_tokens <= MAX_TOKENS_PER_CHUNK {
+            tracing::info!(
+                "🔒 Normalized text fits in single chunk ({} tokens), scanning directly",
+                total_tokens
+            );
+            return self.scan_single_chunk(normalized_text, model).await;
+        }
+
+        // Generate sequential chunks (no overlap)
+        let chunks = self.generate_sequential_chunks(tokens, tokenizer, MAX_TOKENS_PER_CHUNK)?;
+
+        tracing::info!(
+            "🔒 Generated {} sequential chunks of max {} tokens each",
+            chunks.len(),
+            MAX_TOKENS_PER_CHUNK
+        );
+
+        // Scan each chunk and look for any malicious content
+        let threshold = self.get_threshold_from_config();
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let chunk_num = chunk_idx + 1;
+
+            tracing::info!(
+                "🔒 Scanning chunk {} of {}: {} tokens, {} chars, preview: '{}'",
+                chunk_num,
+                chunks.len(),
+                chunk.token_count,
+                chunk.text.len(),
+                chunk.text.chars().take(100).collect::<String>()
+            );
+
+            match self.scan_single_chunk(&chunk.text, model).await {
+                Ok(chunk_result) => {
+                    tracing::info!(
+                        "🔒 Chunk {} result: confidence={:.3}, threshold={:.3}, malicious={}",
+                        chunk_num,
+                        chunk_result.confidence,
+                        threshold,
+                        chunk_result.is_malicious
+                    );
+
+                    // If ANY chunk is flagged as malicious, trigger security warning
+                    if chunk_result.is_malicious {
+                        tracing::warn!(
+                            "🔒 Malicious content detected in chunk {} of {}: confidence={:.3}",
+                            chunk_num,
+                            chunks.len(),
+                            chunk_result.confidence
+                        );
+
+                        return Ok(ScanResult {
+                            is_malicious: true,
+                            confidence: chunk_result.confidence,
+                            explanation: format!(
+                                "Normalized 512-token scan: Malicious content detected in chunk {} of {} (tokens {}-{}): {}",
+                                chunk_num, chunks.len(), chunk.start_token, chunk.end_token, chunk_result.explanation
+                            ),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("🔒 Failed to scan chunk {}: {}", chunk_num, e);
+                    // Continue with other chunks even if one fails
+                }
+            }
+        }
+
+        // All chunks passed - content is safe
+        tracing::info!(
+            "🔒 All {} chunks passed security scan - content is safe",
+            chunks.len()
+        );
+
+        Ok(ScanResult {
+            is_malicious: false,
+            confidence: 0.0,
+            explanation: format!(
+                "Normalized 512-token scan: Analyzed {} sequential chunks ({} tokens total), no threats detected",
+                chunks.len(), total_tokens
+            ),
+        })
+    }
+
+    /// Generate sequential chunks with no overlap for 512-token scanning
+    fn generate_sequential_chunks(
+        &self,
+        tokens: &[u32],
+        tokenizer: &Arc<Tokenizer>,
+        chunk_size: usize,
+    ) -> Result<Vec<SequentialChunk>> {
+        let mut chunks = Vec::new();
+        let total_tokens = tokens.len();
+        let mut start_token = 0;
+
+        while start_token < total_tokens {
+            let end_token = std::cmp::min(start_token + chunk_size, total_tokens);
+
+            // Extract token slice and decode back to text
+            let chunk_tokens = &tokens[start_token..end_token];
+            let chunk_text = tokenizer
+                .decode(chunk_tokens, true)
+                .map_err(|e| anyhow!("Failed to decode chunk tokens: {}", e))?;
+
+            chunks.push(SequentialChunk {
+                start_token,
+                end_token,
+                token_count: chunk_tokens.len(),
+                text: chunk_text,
+            });
+
+            // Move to next chunk (no overlap)
+            start_token = end_token;
+        }
+
+        Ok(chunks)
+    }
+
+    // COMMENTED OUT: Sliding window approach - keeping for reference
+    /*
     /// Scan text with ML model using mathematically guaranteed sliding window approach
     async fn scan_with_ml_model_chunked(
         &self,
@@ -749,6 +1259,7 @@ impl PromptInjectionScanner {
 
         Ok(windows)
     }
+    */
 
     /// Scan a single chunk of text with the ML model
     async fn scan_single_chunk(
@@ -990,6 +1501,15 @@ impl Default for PromptInjectionScanner {
 /// Represents a sliding window for ML scanning
 #[derive(Debug, Clone)]
 struct SlidingWindow {
+    start_token: usize,
+    end_token: usize,
+    token_count: usize,
+    text: String,
+}
+
+/// Represents a sequential chunk for 512-token scanning
+#[derive(Debug, Clone)]
+struct SequentialChunk {
     start_token: usize,
     end_token: usize,
     token_count: usize,

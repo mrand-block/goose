@@ -84,10 +84,8 @@ impl SecurityManager {
             });
         };
 
-        // Use existing scanner infrastructure to analyze response content
-        let scan_result = scanner
-            .scan_with_prompt_injection_model(response_content)
-            .await?;
+        // Use new tool response scanning with normalization and 512-token chunking
+        let scan_result = scanner.scan_tool_response_content(response_content).await?;
 
         let finding_id = format!(
             "RESP-{}",
@@ -256,7 +254,7 @@ impl SecurityManager {
                 if prompt_result.is_malicious {
                     let finding_id = format!(
                         "RCP-{}",
-                        uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8].to_string()
+                        &uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8]
                     );
 
                     tracing::warn!(
@@ -298,8 +296,7 @@ impl SecurityManager {
                     if context_result.is_malicious {
                         let finding_id = format!(
                             "RCC-{}",
-                            uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8]
-                                .to_string()
+                            &uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8]
                         );
 
                         tracing::warn!(
