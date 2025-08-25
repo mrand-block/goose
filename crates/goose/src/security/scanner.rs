@@ -663,31 +663,48 @@ impl PromptInjectionScanner {
         Ok(pattern_result)
     }
 
-    /// Level 11: Optimized smart filtering - best of all approaches
-    /// Uses statistical analysis to intelligently determine content type and apply appropriate deduplication
+    /// Level 15: N-gram deduplication normalization
+    /// Apply ultra-aggressive word deduplication, then remove repetitive 2-grams and 3-grams
     fn normalize_text(&self, text: &str) -> String {
+        self.level_15_ngram_deduplication_normalization(text)
+    }
+
+    /// Level 15: N-gram deduplication normalization
+    /// Apply Level 14's word deduplication, then remove repetitive N-grams (2-grams, 3-grams).
+    /// This targets repetitive phrases like "kgoose service src" appearing multiple times.
+    ///
+    /// Strategy:
+    /// 1. Replace special characters with spaces to properly separate tokens
+    /// 2. Apply ultra-aggressive word deduplication: remove ANY word that appears more than once
+    /// 3. Apply N-gram deduplication: remove repetitive 2-grams and 3-grams
+    /// 4. Final cleanup and space collapse (no spaces in final output)
+    fn level_15_ngram_deduplication_normalization(&self, text: &str) -> String {
         use regex::Regex;
+
+        if text.trim().is_empty() {
+            return text.to_string();
+        }
 
         let mut normalized = text.to_string();
 
-        // Step 1: Apply Level 7 normalization first (filesystem cleanup)
-        // Remove permission strings like "-rwxr-xr-x"
+        // Step 1: Pre-normalization - replace special chars with spaces to separate tokens properly
+        // Remove permission strings first
         let perm_regex = Regex::new(r"-[rwx-]{9}").unwrap();
         normalized = perm_regex.replace_all(&normalized, "").to_string();
 
-        // Remove directory permissions like "drwxr-xr-x"
+        // Remove directory permissions
         let dir_perm_regex = Regex::new(r"drwx[rwx-]*").unwrap();
         normalized = dir_perm_regex.replace_all(&normalized, "").to_string();
 
-        // Remove file sizes like "1024", "2K", "5MB"
+        // Remove file sizes
         let size_regex = Regex::new(r"\b\d+[BKMG]?\b").unwrap();
         normalized = size_regex.replace_all(&normalized, "").to_string();
 
-        // Remove timestamps like "Aug 21 14:30"
+        // Remove timestamps
         let timestamp_regex = Regex::new(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}\b").unwrap();
         normalized = timestamp_regex.replace_all(&normalized, "").to_string();
 
-        // Remove dates like "Aug 21 2024"
+        // Remove dates
         let date_regex = Regex::new(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\b").unwrap();
         normalized = date_regex.replace_all(&normalized, "").to_string();
 
@@ -695,18 +712,175 @@ impl PromptInjectionScanner {
         let total_regex = Regex::new(r"\btotal\s+\d+\b").unwrap();
         normalized = total_regex.replace_all(&normalized, "").to_string();
 
-        // Remove special chars + numbers (keep only letters and spaces)
-        let letters_only_regex = Regex::new(r"[^a-zA-Z\s]").unwrap();
-        normalized = letters_only_regex.replace_all(&normalized, "").to_string();
+        // Replace special characters and numbers with spaces (but keep letters)
+        let special_char_regex = Regex::new(r"[^a-zA-Z\s]").unwrap();
+        normalized = special_char_regex.replace_all(&normalized, " ").to_string();
 
-        // Step 2: Optimized context-aware pattern removal
-        normalized = self.optimized_repetitive_pattern_removal(&normalized);
-
-        // Step 3: Collapse all whitespace
+        // Normalize whitespace
         let whitespace_regex = Regex::new(r"\s+").unwrap();
-        normalized = whitespace_regex.replace_all(&normalized, "").to_string();
+        normalized = whitespace_regex
+            .replace_all(&normalized, " ")
+            .trim()
+            .to_string();
 
-        normalized
+        // Step 2: Ultra-aggressive word deduplication - remove ANY word that appears more than once
+        let deduplicated_text = self.ultra_aggressive_deduplication(&normalized);
+
+        // Step 3: N-gram deduplication - remove repetitive phrases
+        let ngram_deduplicated_text = self.ngram_deduplication(&deduplicated_text);
+
+        // Step 4: Final cleanup - collapse spaces (back to no spaces like Level 14)
+        let final_text = whitespace_regex
+            .replace_all(&ngram_deduplicated_text, "")
+            .to_string();
+
+        if final_text.is_empty() {
+            "EMPTY_CONTENT".to_string()
+        } else {
+            final_text
+        }
+    }
+
+    /// Ultra-aggressive deduplication: Remove ANY word that appears more than once.
+    /// Keep only the first occurrence of every word.
+    fn ultra_aggressive_deduplication(&self, text: &str) -> String {
+        use regex::Regex;
+        use std::collections::HashSet;
+
+        // Split into words for analysis
+        let word_regex = Regex::new(r"\w+").unwrap();
+        let words: Vec<&str> = word_regex.find_iter(text).map(|m| m.as_str()).collect();
+
+        if words.len() < 2 {
+            return text.to_string();
+        }
+
+        // Ultra-simple approach: remove ANY word that appears more than once
+        let mut filtered_words = Vec::new();
+        let mut seen_words = HashSet::new();
+        let word_count = words.len();
+
+        for word in words {
+            if !seen_words.contains(word) {
+                filtered_words.push(word);
+                seen_words.insert(word);
+            }
+            // Skip all subsequent occurrences of this word
+        }
+
+        tracing::debug!(
+            "🔒 Ultra-aggressive deduplication: {} words -> {} words",
+            word_count,
+            filtered_words.len()
+        );
+
+        filtered_words.join(" ")
+    }
+
+    /// Remove repetitive N-grams (2-grams and 3-grams) from text.
+    /// This targets repetitive phrases like "kgoose service src" appearing multiple times.
+    fn ngram_deduplication(&self, text: &str) -> String {
+        use std::collections::{HashMap, HashSet};
+
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.len() < 3 {
+            return text.to_string();
+        }
+
+        // Step 1: Remove repetitive 2-grams (bigrams)
+        let mut bigrams = Vec::new();
+        for i in 0..words.len().saturating_sub(1) {
+            let bigram = format!("{} {}", words[i], words[i + 1]);
+            bigrams.push((bigram, i));
+        }
+
+        // Count bigram frequencies
+        let mut bigram_counts = HashMap::new();
+        for (bigram, _) in &bigrams {
+            *bigram_counts.entry(bigram.clone()).or_insert(0) += 1;
+        }
+
+        // Mark positions to remove (keep only first occurrence of repetitive bigrams)
+        let mut positions_to_remove = HashSet::new();
+        let mut seen_repetitive_bigrams = HashSet::new();
+
+        for (bigram, pos) in bigrams {
+            if bigram_counts[&bigram] > 1 {
+                // Repetitive bigram
+                if seen_repetitive_bigrams.contains(&bigram) {
+                    // Remove this occurrence (mark both positions)
+                    positions_to_remove.insert(pos);
+                    positions_to_remove.insert(pos + 1);
+                } else {
+                    // Keep first occurrence
+                    seen_repetitive_bigrams.insert(bigram);
+                }
+            }
+        }
+
+        // Step 2: Remove repetitive 3-grams (trigrams) from remaining words
+        let remaining_words: Vec<&str> = words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !positions_to_remove.contains(i))
+            .map(|(_, word)| *word)
+            .collect();
+
+        let final_words = if remaining_words.len() >= 3 {
+            let mut trigrams = Vec::new();
+            for i in 0..remaining_words.len().saturating_sub(2) {
+                let trigram = format!(
+                    "{} {} {}",
+                    remaining_words[i],
+                    remaining_words[i + 1],
+                    remaining_words[i + 2]
+                );
+                trigrams.push((trigram, i));
+            }
+
+            // Count trigram frequencies
+            let mut trigram_counts = HashMap::new();
+            for (trigram, _) in &trigrams {
+                *trigram_counts.entry(trigram.clone()).or_insert(0) += 1;
+            }
+
+            // Mark additional positions to remove
+            let mut additional_positions_to_remove = HashSet::new();
+            let mut seen_repetitive_trigrams = HashSet::new();
+
+            for (trigram, pos) in trigrams {
+                if trigram_counts[&trigram] > 1 {
+                    // Repetitive trigram
+                    if seen_repetitive_trigrams.contains(&trigram) {
+                        // Remove this occurrence (mark all three positions)
+                        additional_positions_to_remove.insert(pos);
+                        additional_positions_to_remove.insert(pos + 1);
+                        additional_positions_to_remove.insert(pos + 2);
+                    } else {
+                        // Keep first occurrence
+                        seen_repetitive_trigrams.insert(trigram);
+                    }
+                }
+            }
+
+            // Apply trigram removal
+            remaining_words
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !additional_positions_to_remove.contains(i))
+                .map(|(_, word)| *word)
+                .collect()
+        } else {
+            remaining_words
+        };
+
+        tracing::debug!(
+            "🔒 N-gram deduplication: {} words -> {} words",
+            words.len(),
+            final_words.len()
+        );
+
+        final_words.join(" ")
     }
 
     /// Optimized context-aware repetitive pattern removal using statistical and linguistic
